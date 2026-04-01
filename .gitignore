@@ -1,0 +1,33 @@
+# Data and experiment artifacts
+data/
+cache/
+results/
+condor/
+
+# Vendored or external code
+teachopencadd/
+trachopencadd/
+
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Notebook and editor noise
+.ipynb_checkpoints/
+.DS_Store
+*.swp
+*.swo

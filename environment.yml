@@ -1,0 +1,40 @@
+name: combi
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # core data/science
+  - rdkit
+  - pandas
+  - numpy
+  - scipy
+  - scikit-learn
+  - h5py
+  - tqdm
+  - prettytable
+
+  # notebooks/plots (optional but handy)
+  - matplotlib
+  - seaborn
+  - ipykernel
+  - jupyterlab
+
+  # PyTorch + CUDA (no version pins)
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda
+
+  # misc often needed
+  - pyyaml
+  - requests
+
+  - pip:
+      - transformers
+      - datasets
+      - accelerate
