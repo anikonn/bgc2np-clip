@@ -171,8 +171,8 @@ Run:
 ```bash
 python -m projects.mibig_bgc_np.scripts.eval_retrieval \
   --data_dir data/MIBIG/processed \
-  --cache_dir cache/mibig_default \
-  --checkpoint results/mibig_default/contrastive_model_best.pt \
+  --cache_dir cache/mibig_onehot \
+  --checkpoint results/mibig_onehot/contrastive_model_best.pt \
   --split test \
   --config projects/mibig_bgc_np/configs/default.yaml
 ```
@@ -239,19 +239,24 @@ Writes under `results/.../viz/`:
 - `{split}_bgc_class_embeddings.csv`
 - `{split}_bgc_class_embeddings.parquet` if parquet support is installed
 
-### Step 5: Train the downstream BGC classifier
+### Step 5: Train downstream tasks on frozen embeddings
 
 Purpose:
 
-- freeze the learned BGC encoder from the contrastive checkpoint
-- train a classifier over projected BGC embeddings
-- predict `bgc_class` labels for val and test splits
+- freeze the learned CLIP encoders from the contrastive checkpoint
+- train task-specific heads over frozen projected embeddings
+- support three downstream tasks:
+  `bgc_class` on the BGC side
+  `compound_mw` regression on the compound side
+  `origin_type` binary classification on the compound side
 
 Requirements:
 
 - `mibig_pairs.tsv` must include a `bgc_class` column
 - each `bgc_id` must map to exactly one `bgc_class`
 - val and test labels must already appear in the training split
+- `compound_mw` and `origin_type` additionally require RDKit for strict InChIKey or canonical-SMILES matching against NPAtlas
+- `origin_type` keeps only rows with `origin_type` equal to `Fungus` or `Bacterium`
 
 Run:
 
@@ -260,24 +265,62 @@ python -m projects.mibig_bgc_np.scripts.train_downstream \
   --data_dir data/MIBIG/processed \
   --cache_dir cache/mibig_default \
   --checkpoint results/mibig_default/contrastive_model_best.pt \
-  --config projects/mibig_bgc_np/configs/default.yaml
+  --config projects/mibig_bgc_np/configs/default.yaml \
+  --task bgc_class \
+  --trials 100
 ```
 
-If you want a different split file:
+Run the new compound regression task:
+
+```bash
+python -m projects.mibig_bgc_np.scripts.train_downstream \
+  --data_dir data/MIBIG/processed \
+  --cache_dir cache/mibig_onehot \
+  --checkpoint results/mibig_onehot/contrastive_model_best.pt \
+  --config projects/mibig_bgc_np/configs/default.yaml \
+  --task compound_mw \
+  --npatlas_path data/NPAtlas_download_2024_09.tsv \
+  --mibig_pairs_path data/MIBIG/processed/mibig_pairs.tsv \
+  --mw_bins 50 \
+  --trials 50
+```
+
+Run multiple tasks together:
 
 ```bash
 python -m projects.mibig_bgc_np.scripts.train_downstream \
   --data_dir data/MIBIG/processed \
   --cache_dir cache/mibig_default \
   --checkpoint results/mibig_default/contrastive_model_best.pt \
-  --splits_path data/MIBIG/splits/random_seed42.tsv \
-  --config projects/mibig_bgc_np/configs/default.yaml
+  --config projects/mibig_bgc_np/configs/default.yaml \
+  --task bgc_class \
+  --task compound_mw \
+  --task origin_type \
+  --trials 100 \
+  --save_cm_png \
+  --class_names_path class_names.txt \
+  --force_rebuild_match
 ```
 
 Writes:
 
 - `results/.../downstream_classifier.pt`
 - `results/.../downstream_metrics.json`
+- `results/.../downstream_compound_mw_regressor.pt`
+- `results/.../downstream_compound_mw_metrics.json`
+- `results/.../downstream_mw_hist.png`
+- `results/.../downstream_origin_type_classifier.pt`
+- `results/.../downstream_origin_type_metrics.json`
+- `results/.../matched_compounds.tsv`
+- `results/.../downstream_confusion_matrix_val.png` and `results/.../downstream_confusion_matrix_test.png` if `--save_cm_png` is set
+- `results/.../downstream_wrong_ratios_val.png` and `results/.../downstream_wrong_ratios_test.png` if `--save_cm_png` is set
+- `results/.../downstream_origin_type_confusion_matrix_val.png` and `results/.../downstream_origin_type_confusion_matrix_test.png` if `--save_cm_png` is set
+
+The BGC classifier metrics JSON includes overall loss/accuracy/macro-F1/micro-F1, raw and row-normalized confusion matrices, per-class precision/recall/F1/support, wrong-prediction class ratios, and three baselines: majority class, uniform random, and train-prior random.
+
+The compound molecular-weight metrics JSON includes MSE, RMSE, R^2, Spearman correlation, a train-mean baseline, and a permutation baseline summarized across `--trials`.
+
+The origin-type metrics JSON includes accuracy, macro-F1, positive-class precision/recall/F1 with `Fungus` as the positive class, confusion matrices, ROC-AUC, and three baselines: majority, uniform random, and train-prior random.
 
 ## Config overrides
 
