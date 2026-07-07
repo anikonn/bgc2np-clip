@@ -2,5 +2,6 @@
 
 from .classification import BGCClassifier
 from .clip_dual import DualEncoderCLIP
+from .projection import ProjectionHead
 
-__all__ = ["BGCClassifier", "DualEncoderCLIP"]
+__all__ = ["BGCClassifier", "DualEncoderCLIP", "ProjectionHead"]

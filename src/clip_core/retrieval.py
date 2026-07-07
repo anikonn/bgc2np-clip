@@ -11,9 +11,19 @@ class RetrievalMetrics:
     recall_at_1: float
     recall_at_5: float
     recall_at_10: float
+    recall_at_20: float
+    recall_at_50: float
+    recall_at_100: float
+    recall_at_200: float
+    recall_at_500: float
     precision_at_1: float
     precision_at_5: float
     precision_at_10: float
+    precision_at_20: float
+    precision_at_50: float
+    precision_at_100: float
+    precision_at_200: float
+    precision_at_500: float
     mrr: float
 
 
@@ -26,13 +36,13 @@ def batched_similarity(a: torch.Tensor, b: torch.Tensor, batch_size: int = 1024)
 
 
 def _metrics_from_sorted_positive_mask(sorted_pos: torch.Tensor) -> RetrievalMetrics:
-    r1 = float(sorted_pos[:, :1].any(dim=1).float().mean().item())
-    r5 = float(sorted_pos[:, :5].any(dim=1).float().mean().item())
-    r10 = float(sorted_pos[:, :10].any(dim=1).float().mean().item())
+    def recall_at(k: int) -> float:
+        cutoff = min(int(k), int(sorted_pos.size(1)))
+        return float(sorted_pos[:, :cutoff].any(dim=1).float().mean().item())
 
-    p1 = float((sorted_pos[:, :1].float().sum(dim=1) / 1.0).mean().item())
-    p5 = float((sorted_pos[:, :5].float().sum(dim=1) / 5.0).mean().item())
-    p10 = float((sorted_pos[:, :10].float().sum(dim=1) / 10.0).mean().item())
+    def precision_at(k: int) -> float:
+        cutoff = min(int(k), int(sorted_pos.size(1)))
+        return float((sorted_pos[:, :cutoff].float().sum(dim=1) / float(k)).mean().item())
 
     has_pos = sorted_pos.any(dim=1)
     first_idx = sorted_pos.float().argmax(dim=1)
@@ -40,12 +50,22 @@ def _metrics_from_sorted_positive_mask(sorted_pos: torch.Tensor) -> RetrievalMet
     mrr = float((1.0 / ranks.float()).mean().item())
 
     return RetrievalMetrics(
-        recall_at_1=r1,
-        recall_at_5=r5,
-        recall_at_10=r10,
-        precision_at_1=p1,
-        precision_at_5=p5,
-        precision_at_10=p10,
+        recall_at_1=recall_at(1),
+        recall_at_5=recall_at(5),
+        recall_at_10=recall_at(10),
+        recall_at_20=recall_at(20),
+        recall_at_50=recall_at(50),
+        recall_at_100=recall_at(100),
+        recall_at_200=recall_at(200),
+        recall_at_500=recall_at(500),
+        precision_at_1=precision_at(1),
+        precision_at_5=precision_at(5),
+        precision_at_10=precision_at(10),
+        precision_at_20=precision_at(20),
+        precision_at_50=precision_at(50),
+        precision_at_100=precision_at(100),
+        precision_at_200=precision_at(200),
+        precision_at_500=precision_at(500),
         mrr=mrr,
     )
 
@@ -82,7 +102,7 @@ def evaluate_global_retrieval_multi(
     """
     Multi-positive retrieval evaluation over two embedding sets.
 
-    The legacy protein/ligand argument names are kept for KIBA compatibility.
+    The legacy protein/ligand argument names are kept for backward compatibility.
     """
     left = protein_embs if protein_embs is not None else left_embs
     right = ligand_embs if ligand_embs is not None else right_embs

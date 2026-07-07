@@ -11,8 +11,8 @@ ensure_src_path()
 
 from clip_core.config import apply_overrides, load_yaml
 from clip_core.logging import setup_logger
-from kiba_clip.utils.seed import set_seed
 from projects.mibig_bgc_np.training.contrastive_trainer import train_contrastive
+from projects.mibig_bgc_np.utils.seed import set_seed
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--cache_dir", type=str, required=True)
     parser.add_argument("--splits_path", type=str, default=None)
+    parser.add_argument("--cv_fold", type=int, default=None)
     parser.add_argument("--config", type=str, default="projects/mibig_bgc_np/configs/default.yaml")
     parser.add_argument("--override", nargs="*", default=[])
     return parser.parse_args()
@@ -41,6 +42,7 @@ def main() -> None:
         cfg=cfg,
         device=device,
         splits_path=splits_path,
+        cv_fold=args.cv_fold,
     )
     logger.info("Train loss: %.6f", metrics["train"]["loss_last_epoch"])
 

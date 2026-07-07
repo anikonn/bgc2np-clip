@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from clip_core.logging import save_json
 from mibig_clip.eval.retrieval import evaluate_global_retrieval_multi
+from projects.mibig_bgc_np.eval.retrieval_class_metrics import evaluate_bgc_class_retrieval
 from projects.mibig_bgc_np.data.datasets import CachedInteractionDataset, build_interactions, collate_interactions
 from projects.mibig_bgc_np.models.clip_dual import DualEncoderCLIP
 
@@ -48,6 +49,30 @@ def _build_loader(
         num_workers=num_workers,
         collate_fn=collate_interactions,
         pin_memory=True,
+    )
+
+
+def _build_positive_pair_set(interactions: pd.DataFrame, split: str) -> set[tuple[str, str]]:
+    split_df = interactions[interactions["split"].str.lower() == split.lower()]
+    return {
+        (str(row.bgc_id), str(row.compound_id))
+        for row in split_df[["bgc_id", "compound_id"]].drop_duplicates().itertuples(index=False)
+    }
+
+
+def _build_batch_positive_mask(
+    bgc_ids: list[str],
+    compound_ids: list[str],
+    positive_pairs: set[tuple[str, str]],
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.tensor(
+        [
+            [(str(bgc_id), str(compound_id)) in positive_pairs for compound_id in compound_ids]
+            for bgc_id in bgc_ids
+        ],
+        dtype=torch.bool,
+        device=device,
     )
 
 
@@ -116,6 +141,35 @@ def evaluate_split_retrieval(
     )
 
 
+def evaluate_split_bgc_class_retrieval(
+    model: torch.nn.Module,
+    interactions: pd.DataFrame,
+    split: str,
+    bgc_cache_path: Path,
+    compound_cache_path: Path,
+    device: torch.device,
+) -> dict[str, Any]:
+    bgc_cache = torch.load(bgc_cache_path, map_location="cpu")
+    compound_cache = torch.load(compound_cache_path, map_location="cpu")
+    bgc_index, compound_index, bgc_embs, compound_embs, pairs = build_unique_embeddings(
+        model=model,
+        interactions=interactions,
+        split=split,
+        bgc_cache=bgc_cache,
+        compound_cache=compound_cache,
+        device=device,
+    )
+    sim = model.get_logit_scale().detach().cpu() * (bgc_embs @ compound_embs.t())
+    return evaluate_bgc_class_retrieval(
+        sim=sim,
+        bgc_ids=list(bgc_index.keys()),
+        compound_ids=list(compound_index.keys()),
+        pairs=pairs,
+        interactions=interactions,
+        split=split,
+    )
+
+
 def _val_selection_score(retrieval_metrics: dict[str, dict[str, float]]) -> float:
     bgc_to_compound = retrieval_metrics.get("bgc_to_compound", {})
     compound_to_bgc = retrieval_metrics.get("compound_to_bgc", {})
@@ -129,10 +183,12 @@ def train_contrastive(
     device: torch.device,
     *,
     splits_path: str | Path | None = None,
+    cv_fold: int | None = None,
 ) -> tuple[torch.nn.Module, dict[str, Any], pd.DataFrame]:
     """Train CLIP-style projection heads on cached BGC and compound features."""
     bgc_cache_path, compound_cache_path = _get_cached_paths(cache_dir)
-    interactions = build_interactions(data_dir, splits_path=splits_path)
+    interactions = build_interactions(data_dir, splits_path=splits_path, cv_fold=cv_fold)
+    available_splits = set(interactions["split"].astype(str).str.lower().unique().tolist())
 
     bgc_dim, compound_dim = _infer_input_dims(bgc_cache_path, compound_cache_path)
     model = DualEncoderCLIP(
@@ -154,6 +210,7 @@ def train_contrastive(
         num_workers=cfg["train"]["num_workers"],
         shuffle=True,
     )
+    train_positive_pairs = _build_positive_pair_set(interactions, split="train")
     optimizer = AdamW(
         model.parameters(),
         lr=cfg["train"]["lr"],
@@ -167,7 +224,14 @@ def train_contrastive(
     best_score = -1e9
     best_epoch = 0
     best_ckpt_path = outdir / "contrastive_model_best.pt"
-    selection_split = str(cfg.get("eval", {}).get("selection_split", "val"))
+    selection_split = str(cfg.get("eval", {}).get("selection_split", "val")).lower()
+    if selection_split not in available_splits:
+        if "val" in available_splits:
+            selection_split = "val"
+        elif "train" in available_splits:
+            selection_split = "train"
+        else:
+            selection_split = sorted(available_splits)[0]
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -177,9 +241,15 @@ def train_contrastive(
         for batch in progress:
             bgc_features = batch["bgc_feature"].to(device)
             compound_features = batch["compound_feature"].to(device)
+            positive_mask = _build_batch_positive_mask(
+                bgc_ids=batch["bgc_id"],
+                compound_ids=batch["compound_id"],
+                positive_pairs=train_positive_pairs,
+                device=device,
+            )
 
             optimizer.zero_grad(set_to_none=True)
-            loss, _ = model(bgc_features, compound_features)
+            loss, _ = model(bgc_features, compound_features, positive_mask=positive_mask)
             loss.backward()
             optimizer.step()
 
@@ -247,7 +317,9 @@ def train_contrastive(
             "best_checkpoint": str(best_ckpt_path),
         },
     }
-    for split in ("val", "test"):
+    for split in ("train", "val", "test"):
+        if split not in available_splits:
+            continue
         metrics[f"retrieval_{split}"] = evaluate_split_retrieval(
             model=model,
             interactions=interactions,

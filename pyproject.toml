@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kiba-clip"
+name = "mibig-bgc-np"
 version = "0.1.0"
-description = "Shared CLIP core plus KIBA and MIBiG project layouts"
+description = "MIBiG BGC-compound CLIP pipeline"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "Combi"}]

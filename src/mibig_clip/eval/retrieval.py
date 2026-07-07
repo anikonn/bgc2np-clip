@@ -14,7 +14,7 @@ def evaluate_global_retrieval(
     right_embs: object | None = None,
     pair_indices: list[tuple[int, int]] | None = None,
 ) -> dict[str, dict[str, float]]:
-    """Single-positive wrapper kept for API parity with the KIBA module."""
+    """Single-positive wrapper kept for API parity with the shared retrieval helpers."""
     left = bgc_embs if bgc_embs is not None else left_embs
     right = compound_embs if compound_embs is not None else right_embs
     pairs = interaction_pairs if interaction_pairs is not None else pair_indices
@@ -42,7 +42,7 @@ def evaluate_global_retrieval_multi(
     Multi-positive retrieval evaluation for MIBiG BGC-compound embeddings.
 
     The legacy left/right keyword aliases are accepted so this mirrors the
-    flexibility of the shared KIBA-compatible retrieval API.
+    flexibility of the shared retrieval API.
     """
     left = bgc_embs if bgc_embs is not None else left_embs
     right = compound_embs if compound_embs is not None else right_embs

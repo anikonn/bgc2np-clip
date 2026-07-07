@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from kiba_clip.featurization.morgan import MorganConfig, MorganFingerprintFeaturizer
+from projects.mibig_bgc_np.featurization.morgan import MorganConfig, MorganFingerprintFeaturizer
 
 
 @dataclass

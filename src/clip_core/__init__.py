@@ -3,7 +3,7 @@
 from .cache import FeatureCache
 from .config import apply_overrides, load_yaml
 from .logging import save_json, setup_logger
-from .losses import symmetric_infonce_loss
+from .losses import multi_positive_infonce_loss, symmetric_infonce_loss
 from .retrieval import (
     RetrievalMetrics,
     batched_similarity,
@@ -22,4 +22,5 @@ __all__ = [
     "save_json",
     "setup_logger",
     "symmetric_infonce_loss",
+    "multi_positive_infonce_loss",
 ]

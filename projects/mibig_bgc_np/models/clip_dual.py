@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from clip_core.losses import symmetric_infonce_loss
-from kiba_clip.models.projection import ProjectionHead
+from clip_core.losses import multi_positive_infonce_loss, symmetric_infonce_loss
+from projects.mibig_bgc_np.models.projection import ProjectionHead
 
 
 class DualEncoderCLIP(nn.Module):
@@ -38,8 +38,17 @@ class DualEncoderCLIP(nn.Module):
     def get_logit_scale(self) -> torch.Tensor:
         return self.logit_scale.exp().clamp(max=self.max_logit_scale)
 
-    def forward(self, bgc_features: torch.Tensor, compound_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        bgc_features: torch.Tensor,
+        compound_features: torch.Tensor,
+        positive_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         z_bgc = self.encode_bgc(bgc_features)
         z_cmp = self.encode_compound(compound_features)
         logits = self.get_logit_scale() * (z_bgc @ z_cmp.t())
-        return symmetric_infonce_loss(logits), logits
+        if positive_mask is None:
+            loss = symmetric_infonce_loss(logits)
+        else:
+            loss = multi_positive_infonce_loss(logits, positive_mask)
+        return loss, logits

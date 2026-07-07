@@ -5,8 +5,8 @@ from typing import Sequence
 
 import torch
 
-from kiba_clip.featurization.esm2 import ESM2Config, ESM2MeanPoolEmbedder
-from kiba_clip.featurization.one_hot import ProteinOneHotConfig, ProteinOneHotEncoder
+from projects.mibig_bgc_np.featurization.esm2 import ESM2CLSProteinEmbedder, ESM2Config, ESM2MeanPoolEmbedder
+from projects.mibig_bgc_np.featurization.one_hot import ProteinOneHotConfig, ProteinOneHotEncoder
 
 @dataclass
 class BGCOneHotConfig:
@@ -15,7 +15,7 @@ class BGCOneHotConfig:
 
 
 class BGCOneHotEncoder:
-    """Encode each protein with KIBA-style positional one-hot, then mean-pool within each BGC."""
+    """Encode each protein with positional one-hot features, then mean-pool within each BGC."""
 
     def __init__(self, cfg: BGCOneHotConfig) -> None:
         self.cfg = cfg
@@ -48,17 +48,21 @@ class ESM2BGCConfig:
     model_name: str = "facebook/esm2_t6_8M_UR50D"
     max_length: int = 1024
     batch_size: int = 8
+    pooling: str = "mean"
 
 
 class ESM2BGCEncoder:
-    """Mean-pool ESM2 protein embeddings within each BGC."""
+    """Encode proteins with ESM2 and mean-pool the per-protein embeddings within each BGC."""
 
     def __init__(self, cfg: ESM2BGCConfig, device: torch.device) -> None:
         self.cfg = cfg
-        self.embedder = ESM2MeanPoolEmbedder(
-            ESM2Config(model_name=cfg.model_name, max_length=cfg.max_length, batch_size=cfg.batch_size),
-            device=device,
-        )
+        embedder_cfg = ESM2Config(model_name=cfg.model_name, max_length=cfg.max_length, batch_size=cfg.batch_size)
+        if cfg.pooling == "mean":
+            self.embedder = ESM2MeanPoolEmbedder(embedder_cfg, device=device)
+        elif cfg.pooling == "cls":
+            self.embedder = ESM2CLSProteinEmbedder(embedder_cfg, device=device)
+        else:
+            raise ValueError(f"Unsupported ESM2 pooling mode: {cfg.pooling}")
 
     def encode_proteins(self, protein_sequences: Sequence[str]) -> torch.Tensor:
         if not protein_sequences:
@@ -100,20 +104,31 @@ class ESM2BGCEncoder:
 def build_bgc_encoder(
     cfg: dict[str, object], device: torch.device
 ) -> BGCOneHotEncoder | ESM2BGCEncoder:
-    encoder_name = str(cfg.get("bgc_encoder", "one_hot")).lower()
-    if encoder_name == "one_hot":
+    encoder_name = str(cfg.get("bgc_encoder", "ohe")).lower()
+    if encoder_name in {"ohe", "one_hot"}:
         return BGCOneHotEncoder(
             BGCOneHotConfig(
                 max_length=int(cfg.get("protein_max_length", 1024)),
                 alphabet=str(cfg.get("one_hot_alphabet", "ACDEFGHIKLMNPQRSTVWYX")),
             )
         )
-    if encoder_name == "esm2":
+    if encoder_name in {"esm2_mean", "esm2"}:
         return ESM2BGCEncoder(
             ESM2BGCConfig(
                 model_name=str(cfg.get("esm2_model_name", "facebook/esm2_t6_8M_UR50D")),
                 max_length=int(cfg.get("protein_max_length", 1024)),
                 batch_size=int(cfg.get("protein_batch_size", 8)),
+                pooling="mean",
+            ),
+            device=device,
+        )
+    if encoder_name == "esm2_cls":
+        return ESM2BGCEncoder(
+            ESM2BGCConfig(
+                model_name=str(cfg.get("esm2_model_name", "facebook/esm2_t6_8M_UR50D")),
+                max_length=int(cfg.get("protein_max_length", 1024)),
+                batch_size=int(cfg.get("protein_batch_size", 8)),
+                pooling="cls",
             ),
             device=device,
         )

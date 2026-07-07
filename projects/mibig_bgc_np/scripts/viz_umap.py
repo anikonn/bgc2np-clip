@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache_dir", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--splits_path", type=str, default=None)
+    parser.add_argument("--cv_fold", type=int, default=None)
     parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
     parser.add_argument("--config", type=str, default="projects/mibig_bgc_np/configs/default.yaml")
     parser.add_argument("--override", nargs="*", default=[])
@@ -55,8 +56,8 @@ def main() -> None:
     splits_path = args.splits_path if args.splits_path is not None else cfg.get("data", {}).get("splits_path")
     model = _load_model(args.checkpoint, device)
 
-    interactions = build_interactions(args.data_dir, splits_path=splits_path)
-    bgc_class_map = build_bgc_class_map(args.data_dir, splits_path=splits_path)
+    interactions = build_interactions(args.data_dir, splits_path=splits_path, cv_fold=args.cv_fold)
+    bgc_class_map = build_bgc_class_map(args.data_dir, splits_path=splits_path, cv_fold=args.cv_fold)
     bgc_cache = torch.load(Path(args.cache_dir) / "bgc_features.pt", map_location="cpu")
     compound_cache = torch.load(Path(args.cache_dir) / "compound_features.pt", map_location="cpu")
 

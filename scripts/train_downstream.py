@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache_dir", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--splits_path", type=str, default=None)
+    parser.add_argument("--cv_fold", type=int, default=None)
     parser.add_argument("--config", type=str, default="projects/mibig_bgc_np/configs/default.yaml")
     parser.add_argument("--override", nargs="*", default=[])
     parser.add_argument("--trials", type=int, default=100)
@@ -52,7 +53,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         choices=["bgc_class", "compound_mw", "origin_type"],
         default=None,
-        help="Repeat to run multiple downstream tasks. Defaults to bgc_class.",
+        help="Repeat to run a subset of downstream tasks. By default all downstream tasks are run.",
     )
     parser.add_argument("--npatlas_path", type=str, default="data/NPAtlas_download_2024_09.tsv")
     parser.add_argument("--mibig_pairs_path", type=str, default="data/MIBIG/processed/mibig_pairs.tsv")
@@ -64,14 +65,17 @@ def parse_args() -> argparse.Namespace:
 def _log_classification_summary(logger, task_name: str, metrics: dict) -> None:
     class_names = metrics.get("class_names", [])
     for split in ("val", "test"):
+        if split not in metrics:
+            continue
         overall = metrics[split]["overall"]
         logger.info(
-            "%s %s: loss=%.6f accuracy=%.6f macro_f1=%.6f",
+            "%s %s: loss=%.6f accuracy=%.6f macro_f1=%.6f micro_f1=%.6f",
             task_name,
             split,
             overall["loss"],
             overall["accuracy"],
             overall["macro_f1"],
+            overall.get("micro_f1", 0.0),
         )
         if "positive_class" in metrics[split]:
             pos = metrics[split]["positive_class"]
@@ -95,6 +99,8 @@ def _log_classification_summary(logger, task_name: str, metrics: dict) -> None:
 
 def _log_regression_summary(logger, task_name: str, metrics: dict) -> None:
     for split in ("val", "test"):
+        if split not in metrics:
+            continue
         report = metrics[split]
         logger.info(
             "%s %s: loss=%.6f mse=%.6f rmse=%.6f r2=%.6f spearman=%.6f",
@@ -113,7 +119,7 @@ def main() -> None:
     args = parse_args()
     from clip_core.config import apply_overrides, load_yaml
     from clip_core.logging import setup_logger
-    from kiba_clip.utils.seed import set_seed
+    from projects.mibig_bgc_np.utils.seed import set_seed
     logger = setup_logger()
     from projects.mibig_bgc_np.training.downstream_trainer import train_downstream
 
@@ -131,6 +137,7 @@ def main() -> None:
         cfg=cfg,
         device=device,
         splits_path=splits_path,
+        cv_fold=args.cv_fold,
         baseline_trials=int(args.trials),
         class_names=_load_class_names(args.class_names_path),
         save_cm_png=bool(args.save_cm_png),
