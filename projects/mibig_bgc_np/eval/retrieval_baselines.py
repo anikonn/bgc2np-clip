@@ -13,10 +13,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
-from projects.mibig_bgc_np.data.datasets import CachedInteractionDataset, collate_interactions
 from projects.mibig_bgc_np.training.contrastive_trainer import (
     _build_batch_positive_mask,
     _build_positive_pair_set,
@@ -63,9 +62,12 @@ def _metrics_from_sorted_positive_mask(sorted_pos: torch.Tensor) -> dict[str, fl
     first_idx = sorted_pos.float().argmax(dim=1)
     ranks = torch.where(has_pos, first_idx + 1, torch.full_like(first_idx, fill_value=sorted_pos.size(1) + 1))
     metrics = {"mrr": float((1.0 / ranks.float()).mean().item())}
+    positives = float(sorted_pos.float().sum().item())
     for k in (1, 5, 10, 20, 50, 100, 200, 500):
         cutoff = min(int(k), int(sorted_pos.size(1)))
-        metrics[f"recall_at_{k}"] = float(sorted_pos[:, :cutoff].any(dim=1).float().mean().item())
+        hits = float(sorted_pos[:, :cutoff].float().sum().item())
+        metrics[f"hit_at_{k}"] = float(sorted_pos[:, :cutoff].any(dim=1).float().mean().item())
+        metrics[f"recall_at_{k}"] = hits / positives if positives > 0.0 else 0.0
         metrics[f"precision_at_{k}"] = float((sorted_pos[:, :cutoff].float().sum(dim=1) / float(k)).mean().item())
     return metrics
 
@@ -182,7 +184,16 @@ def class_matching_retrieval_baseline(
 
 
 def _stack_cached_features(ids: list[str], cache: dict[str, torch.Tensor]) -> torch.Tensor:
-    return torch.stack([cache[item].float() for item in ids])
+    return torch.stack([_as_baseline_feature(cache[item]) for item in ids])
+
+
+def _as_baseline_feature(feature: torch.Tensor) -> torch.Tensor:
+    feature = feature.float()
+    if feature.ndim == 1:
+        return feature
+    if feature.ndim == 2:
+        return feature.mean(dim=0)
+    raise ValueError(f"Cached feature must be 1D or 2D, got {tuple(feature.shape)}")
 
 
 def _fixed_random_projection(matrix: torch.Tensor, output_dim: int, seed: int) -> torch.Tensor:
@@ -289,6 +300,46 @@ class LinearDualEncoderCLIP(nn.Module):
         return loss, logits
 
 
+class _MeanPooledCachedInteractionDataset(Dataset):
+    """Cached interaction dataset for baselines that require fixed 1D feature vectors."""
+
+    def __init__(
+        self,
+        interactions: pd.DataFrame,
+        bgc_cache_path: str | Path,
+        compound_cache_path: str | Path,
+        split: str,
+    ) -> None:
+        self.frame = interactions[
+            interactions["split"].astype(str).str.lower() == str(split).lower()
+        ].copy().reset_index(drop=True)
+        self.bgc_cache: dict[str, torch.Tensor] = torch.load(bgc_cache_path, map_location="cpu")
+        self.compound_cache: dict[str, torch.Tensor] = torch.load(compound_cache_path, map_location="cpu")
+
+    def __len__(self) -> int:
+        return int(len(self.frame))
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        row = self.frame.iloc[int(index)]
+        bgc_id = str(row["bgc_id"])
+        compound_id = str(row["compound_id"])
+        return {
+            "bgc_id": bgc_id,
+            "compound_id": compound_id,
+            "bgc_feature": _as_baseline_feature(self.bgc_cache[bgc_id]),
+            "compound_feature": _as_baseline_feature(self.compound_cache[compound_id]),
+        }
+
+
+def _collate_mean_pooled_interactions(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "bgc_id": [str(item["bgc_id"]) for item in batch],
+        "compound_id": [str(item["compound_id"]) for item in batch],
+        "bgc_feature": torch.stack([item["bgc_feature"] for item in batch]),
+        "compound_feature": torch.stack([item["compound_feature"] for item in batch]),
+    }
+
+
 def _build_loader(
     interactions: pd.DataFrame,
     cache_dir: str | Path,
@@ -298,13 +349,13 @@ def _build_loader(
     shuffle: bool,
 ) -> DataLoader:
     bgc_cache_path, compound_cache_path = _get_cached_paths(cache_dir)
-    dataset = CachedInteractionDataset(interactions, bgc_cache_path, compound_cache_path, split)
+    dataset = _MeanPooledCachedInteractionDataset(interactions, bgc_cache_path, compound_cache_path, split)
     return DataLoader(
         dataset,
         batch_size=int(cfg["train"]["batch_size"]),
         shuffle=shuffle,
         num_workers=int(cfg["train"]["num_workers"]),
-        collate_fn=collate_interactions,
+        collate_fn=_collate_mean_pooled_interactions,
         pin_memory=True,
     )
 
@@ -440,11 +491,11 @@ def evaluate_model_retrieval_baseline(
     with torch.no_grad():
         for start in range(0, len(bgc_ids), batch_size):
             ids = bgc_ids[start : start + batch_size]
-            bgc_chunks.append(model.encode_bgc(torch.stack([bgc_cache[item].float() for item in ids]).to(device)).cpu())
+            bgc_chunks.append(model.encode_bgc(_stack_cached_features(ids, bgc_cache).to(device)).cpu())
         for start in range(0, len(compound_ids), batch_size):
             ids = compound_ids[start : start + batch_size]
             compound_chunks.append(
-                model.encode_compound(torch.stack([compound_cache[item].float() for item in ids]).to(device)).cpu()
+                model.encode_compound(_stack_cached_features(ids, compound_cache).to(device)).cpu()
             )
     bgc_embs = torch.cat(bgc_chunks, dim=0) if bgc_chunks else torch.empty((0, 0))
     compound_embs = torch.cat(compound_chunks, dim=0) if compound_chunks else torch.empty((0, 0))
@@ -482,8 +533,10 @@ def knn_transfer_retrieval_baseline(
     train_compound_ids = sorted(train_df["compound_id"].astype(str).unique().tolist())
     test_bgc_features = _normalize_feature_matrix(bgc_ids, bgc_cache)
     train_bgc_features = _normalize_feature_matrix(train_bgc_ids, bgc_cache)
+    test_compound_features = _normalize_feature_matrix(compound_ids, compound_cache)
+    train_compound_features = _normalize_feature_matrix(train_compound_ids, compound_cache)
     bgc_train_sim = test_bgc_features @ train_bgc_features.t()
-    compound_train_sim = _tanimoto_feature_matrix(compound_ids, train_compound_ids, compound_cache)
+    compound_train_sim = test_compound_features @ train_compound_features.t()
 
     train_bgcs_by_compound: dict[str, list[int]] = {}
     train_bgc_index = {bgc_id: idx for idx, bgc_id in enumerate(train_bgc_ids)}
@@ -495,21 +548,28 @@ def knn_transfer_retrieval_baseline(
     for row in train_df[["bgc_id", "compound_id"]].drop_duplicates().itertuples(index=False):
         train_compounds_by_bgc.setdefault(str(row.bgc_id), []).append(train_compound_index[str(row.compound_id)])
 
-    results: dict[str, Any] = {"name": "knn_transfer", "k_values": [int(k) for k in k_values], "metrics_by_k": {}}
+    results: dict[str, Any] = {
+        "name": "knn_transfer",
+        "route_scoring": "maximum similarity over associated training routes",
+        "bgc_similarity": "cosine",
+        "compound_similarity": "cosine",
+        "k_values": [int(k) for k in k_values],
+        "metrics_by_k": {},
+    }
     for k in k_values:
         bgc_to_compound = torch.zeros((len(bgc_ids), len(compound_ids)), dtype=torch.float32)
         for j, compound_id in enumerate(compound_ids):
             train_indices = train_bgcs_by_compound.get(str(compound_id), [])
             if train_indices:
                 values = bgc_train_sim[:, train_indices]
-                bgc_to_compound[:, j] = values.topk(k=min(int(k), values.size(1)), dim=1).values.mean(dim=1)
+                bgc_to_compound[:, j] = values.max(dim=1).values
 
         compound_to_bgc = torch.zeros((len(compound_ids), len(bgc_ids)), dtype=torch.float32)
         for i, bgc_id in enumerate(bgc_ids):
             train_indices = train_compounds_by_bgc.get(str(bgc_id), [])
             if train_indices:
                 values = compound_train_sim[:, train_indices]
-                compound_to_bgc[:, i] = values.topk(k=min(int(k), values.size(1)), dim=1).values.mean(dim=1)
+                compound_to_bgc[:, i] = values.max(dim=1).values
 
         results["metrics_by_k"][str(int(k))] = evaluate_similarity_retrieval(
             bgc_to_compound,

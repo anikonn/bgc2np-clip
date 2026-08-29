@@ -8,7 +8,13 @@ from .bgc_encoder import (
     build_bgc_encoder,
 )
 from .esm2 import ESM2CLSProteinEmbedder, ESM2Config, ESM2MeanPoolEmbedder
-from .molecule_encoder import MorganCompoundConfig, MorganCompoundEncoder, build_molecule_encoder
+from .molecule_encoder import (
+    MolFormerCompoundConfig,
+    MolFormerCompoundEncoder,
+    MorganCompoundConfig,
+    MorganCompoundEncoder,
+    build_molecule_encoder,
+)
 from .morgan import MorganConfig, MorganFingerprintFeaturizer
 from .one_hot import ProteinOneHotConfig, ProteinOneHotEncoder
 
@@ -21,6 +27,8 @@ __all__ = [
     "ESM2BGCEncoder",
     "ESM2MeanPoolEmbedder",
     "MorganConfig",
+    "MolFormerCompoundConfig",
+    "MolFormerCompoundEncoder",
     "MorganCompoundConfig",
     "MorganCompoundEncoder",
     "MorganFingerprintFeaturizer",

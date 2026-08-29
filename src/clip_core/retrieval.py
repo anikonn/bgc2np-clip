@@ -8,6 +8,14 @@ import torch
 
 @dataclass
 class RetrievalMetrics:
+    hit_at_1: float
+    hit_at_5: float
+    hit_at_10: float
+    hit_at_20: float
+    hit_at_50: float
+    hit_at_100: float
+    hit_at_200: float
+    hit_at_500: float
     recall_at_1: float
     recall_at_5: float
     recall_at_10: float
@@ -36,9 +44,18 @@ def batched_similarity(a: torch.Tensor, b: torch.Tensor, batch_size: int = 1024)
 
 
 def _metrics_from_sorted_positive_mask(sorted_pos: torch.Tensor) -> RetrievalMetrics:
-    def recall_at(k: int) -> float:
+    positives = float(sorted_pos.float().sum().item())
+
+    def hit_at(k: int) -> float:
         cutoff = min(int(k), int(sorted_pos.size(1)))
         return float(sorted_pos[:, :cutoff].any(dim=1).float().mean().item())
+
+    def recall_at(k: int) -> float:
+        cutoff = min(int(k), int(sorted_pos.size(1)))
+        if positives <= 0.0:
+            return 0.0
+        hits = float(sorted_pos[:, :cutoff].float().sum().item())
+        return hits / positives
 
     def precision_at(k: int) -> float:
         cutoff = min(int(k), int(sorted_pos.size(1)))
@@ -50,6 +67,14 @@ def _metrics_from_sorted_positive_mask(sorted_pos: torch.Tensor) -> RetrievalMet
     mrr = float((1.0 / ranks.float()).mean().item())
 
     return RetrievalMetrics(
+        hit_at_1=hit_at(1),
+        hit_at_5=hit_at(5),
+        hit_at_10=hit_at(10),
+        hit_at_20=hit_at(20),
+        hit_at_50=hit_at(50),
+        hit_at_100=hit_at(100),
+        hit_at_200=hit_at(200),
+        hit_at_500=hit_at(500),
         recall_at_1=recall_at(1),
         recall_at_5=recall_at(5),
         recall_at_10=recall_at(10),

@@ -1,0 +1,31 @@
+seed: 42
+finetune:
+  esm_model_name: facebook/esm2_t30_150M_UR50D
+  molformer_model_name: ibm-research/MoLFormer-XL-both-10pct
+  esm_unfreeze: "0"
+  molformer_unfreeze: "0"
+  esm_max_length: 1024
+  molformer_max_length: 202
+  domain_micro_batch: 2
+model:
+  emb_dim: 256
+  hidden_dim: 512
+  dropout: 0.1
+  init_temperature: 0.07
+  max_logit_scale: 100.0
+train:
+  epochs: 10
+  micro_batch_size: 4
+  gradient_accumulation: 32
+  negative_queue_size: 256
+  projection_lr: 0.0003
+  encoder_lr_partial: 0.00001
+  encoder_lr_full: 0.000003
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  warmup_fraction: 0.1
+  # FP16 MolFormer linear attention is numerically unstable on V100.
+  amp: false
+eval:
+  entity_batch_size: 4
+  sim_batch_size: 1024

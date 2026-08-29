@@ -22,15 +22,76 @@ from projects.mibig_bgc_np.eval.classification_metrics import (
     random_baselines,
     wrong_class_ratios,
 )
-from projects.mibig_bgc_np.eval.regression_metrics import rmse, spearman
+from projects.mibig_bgc_np.eval.regression_metrics import pearson, rmse, spearman
 from projects.mibig_bgc_np.data.datasets import build_bgc_class_table, build_interactions
 from projects.mibig_bgc_np.models.classification import BGCClassifier
 from projects.mibig_bgc_np.models.clip_dual import DualEncoderCLIP
+from projects.mibig_bgc_np.training.contrastive_trainer import _pad_bgc_features
 from projects.mibig_bgc_np.models.regression import EmbeddingRegressor
 
 LOGGER = logging.getLogger("mibig_bgc_np")
-DEFAULT_TASKS = ("bgc_class", "compound_mw", "origin_type")
-COMPOUND_TASKS = {"compound_mw", "origin_type"}
+BIOACTIVITY_CLASS_NAMES = ["antibacterial", "cytotoxic", "antifungal", "inhibitor", "siderophore", "antiviral"]
+NPCLASSIFIER_TASKS = {
+    "npclassifier_pathway": {
+        "level": "pathway",
+        "label_column": "npclassifier_pathway",
+        "counts_path": None,
+        "min_count": None,
+        "display_name": "NPClassifier pathway",
+    },
+    "npclassifier_superclass": {
+        "level": "superclass",
+        "label_column": "npclassifier_superclass",
+        "counts_path": "results/downstream_distributions/npclassifier_superclass_counts.csv",
+        "min_count": 100,
+        "display_name": "NPClassifier superclass",
+    },
+    "npclassifier_class": {
+        "level": "class",
+        "label_column": "npclassifier_class",
+        "counts_path": "results/downstream_distributions/npclassifier_class_counts.csv",
+        "min_count": 50,
+        "display_name": "NPClassifier class",
+    },
+}
+DEFAULT_TASKS = (
+    "bgc_class",
+    "bioactivity_class",
+    "npclassifier_pathway",
+    "npclassifier_superclass",
+    "npclassifier_class",
+    "compound_mw",
+    "compound_logp",
+    "compound_tpsa",
+    "origin_type",
+)
+COMPOUND_REGRESSION_TASKS = {
+    "compound_mw": {
+        "target": "compound_molecular_weight",
+        "display_name": "Molecular weight",
+        "short_name": "mw",
+        "hist_title": "Compound molecular weight distribution",
+        "x_label": "Molecular weight",
+        "boxplot_ylabel": "Molecular weight",
+    },
+    "compound_logp": {
+        "target": "compound_logp",
+        "display_name": "Wildman-Crippen logP",
+        "short_name": "logp",
+        "hist_title": "Compound logP distribution",
+        "x_label": "logP",
+        "boxplot_ylabel": "logP",
+    },
+    "compound_tpsa": {
+        "target": "compound_tpsa",
+        "display_name": "Topological polar surface area",
+        "short_name": "tpsa",
+        "hist_title": "Compound TPSA distribution",
+        "x_label": "TPSA",
+        "boxplot_ylabel": "TPSA",
+    },
+}
+COMPOUND_TASKS = set(COMPOUND_REGRESSION_TASKS) | {"origin_type"}
 ORIGIN_LABEL_TO_IDX = {"Bacterium": 0, "Fungus": 1}
 ORIGIN_CLASS_NAMES = ["Bacterium", "Fungus"]
 
@@ -56,6 +117,9 @@ def _load_contrastive_model(
         dropout=cfg["model"]["dropout"],
         init_temperature=cfg["model"]["init_temperature"],
         max_logit_scale=cfg["model"]["max_logit_scale"],
+        bgc_aggregation=str(cfg["model"].get("bgc_aggregation", "prepooled")),
+        bgc_aggregation_config=dict(cfg["model"].get("bgc_aggregation_config", {})),
+        projection_head=str(cfg["model"].get("projection_head", "mlp_gelu")),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -497,13 +561,14 @@ def _regression_metrics_dict(y_true: torch.Tensor, y_pred: torch.Tensor, loss: f
         "mse": mse,
         "rmse": rmse(true_np, pred_np) if true_np.size else 0.0,
         "r2": float(r2),
+        "pearson": pearson(true_np, pred_np) if true_np.size else 0.0,
         "spearman": spearman(true_np, pred_np) if true_np.size else 0.0,
     }
 
 
 def _summarize_regression_trials(trial_metrics: list[dict[str, float]]) -> dict[str, float]:
     summary: dict[str, float] = {}
-    for metric_name in ("mse", "rmse", "r2", "spearman"):
+    for metric_name in ("mse", "rmse", "r2", "pearson", "spearman"):
         values = np.asarray([metrics[metric_name] for metrics in trial_metrics], dtype=np.float64)
         summary[f"{metric_name}_mean"] = float(values.mean()) if values.size else 0.0
         summary[f"{metric_name}_std"] = float(values.std(ddof=0)) if values.size else 0.0
@@ -526,7 +591,7 @@ def _regression_baselines(
     train_mean = float(train_np.mean())
     mean_pred = torch.full_like(y_true, fill_value=train_mean, dtype=torch.float32)
     mean_metrics = _regression_metrics_dict(y_true, mean_pred, loss=float("nan"))
-    for metric_name in ("mse", "rmse", "r2", "spearman"):
+    for metric_name in ("mse", "rmse", "r2", "pearson", "spearman"):
         mean_metrics[f"{metric_name}_mean"] = float(mean_metrics[metric_name])
         mean_metrics[f"{metric_name}_std"] = 0.0
 
@@ -534,7 +599,11 @@ def _regression_baselines(
     generator.manual_seed(int(seed))
     perm_trials: list[dict[str, float]] = []
     if y_true.numel() == 0:
-        perm_summary = {f"{name}_{suffix}": 0.0 for name in ("mse", "rmse", "r2", "spearman") for suffix in ("mean", "std")}
+        perm_summary = {
+            f"{name}_{suffix}": 0.0
+            for name in ("mse", "rmse", "r2", "pearson", "spearman")
+            for suffix in ("mean", "std")
+        }
     else:
         for _ in range(int(trials)):
             perm = torch.randperm(y_true.numel(), generator=generator)
@@ -693,13 +762,20 @@ def _save_wrong_ratio_png(report: dict[str, Any], class_names: list[str], split:
     plt.close(fig)
 
 
-def _save_histogram(values: pd.Series, bins: int, path: Path) -> None:
+def _save_histogram(
+    values: pd.Series,
+    bins: int,
+    path: Path,
+    *,
+    title: str = "Compound molecular weight distribution",
+    xlabel: str = "Molecular weight",
+) -> None:
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(8.0, 5.0))
     ax.hist(values.to_numpy(dtype=np.float64), bins=int(bins), color="#4C78A8", edgecolor="black", linewidth=0.6)
-    ax.set_title("Compound molecular weight distribution")
-    ax.set_xlabel("Molecular weight")
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Count")
     ax.grid(axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
     fig.tight_layout()
@@ -707,7 +783,15 @@ def _save_histogram(values: pd.Series, bins: int, path: Path) -> None:
     plt.close(fig)
 
 
-def _save_grouped_mw_boxplot(df: pd.DataFrame, group_col: str, value_col: str, title: str, path: Path) -> None:
+def _save_grouped_property_boxplot(
+    df: pd.DataFrame,
+    group_col: str,
+    value_col: str,
+    title: str,
+    path: Path,
+    *,
+    ylabel: str,
+) -> None:
     import matplotlib.pyplot as plt
 
     grouped = []
@@ -727,7 +811,7 @@ def _save_grouped_mw_boxplot(df: pd.DataFrame, group_col: str, value_col: str, t
     ax.boxplot(grouped, labels=labels, patch_artist=True)
     ax.set_title(title)
     ax.set_xlabel(group_col.replace("_", " ").title())
-    ax.set_ylabel("Molecular weight")
+    ax.set_ylabel(ylabel)
     ax.grid(axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
     plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
     fig.tight_layout()
@@ -785,6 +869,8 @@ def _build_bgc_multilabel_features(
     label_to_idx: dict[str, int],
     device: torch.device,
     batch_size: int,
+    protein_position_cache: dict[str, torch.Tensor] | None = None,
+    domain_position_cache: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     features: list[torch.Tensor] = []
     labels: list[torch.Tensor] = []
@@ -799,8 +885,28 @@ def _build_bgc_multilabel_features(
     with torch.no_grad():
         for start in range(0, len(bgc_df), batch_size):
             chunk = bgc_df.iloc[start : start + batch_size]
-            bgc_features = torch.stack([bgc_cache[str(bgc_id)] for bgc_id in chunk["bgc_id"].tolist()]).to(device)
-            z_bgc = model.encode_bgc(bgc_features)
+            bgc_features, padding_mask = _pad_bgc_features(
+                [bgc_cache[str(bgc_id)] for bgc_id in chunk["bgc_id"].tolist()], device
+            )
+            position_args: dict[str, torch.Tensor] = {}
+            for name, cache in (
+                ("protein_positions", protein_position_cache),
+                ("domain_positions", domain_position_cache),
+            ):
+                if cache is not None:
+                    values = [cache[str(bgc_id)].long() for bgc_id in chunk["bgc_id"].tolist()]
+                    if padding_mask is None:
+                        position_args[name] = torch.stack(values).to(device)
+                    else:
+                        position_args[name] = torch.nn.utils.rnn.pad_sequence(
+                            values, batch_first=True, padding_value=0
+                        ).to(device)
+                        if position_args[name].shape != padding_mask.shape:
+                            raise ValueError(
+                                f"{name} shape {tuple(position_args[name].shape)} does not match "
+                                f"BGC padding mask {tuple(padding_mask.shape)}"
+                            )
+            z_bgc = model.encode_bgc(bgc_features, padding_mask=padding_mask, **position_args)
             y = torch.zeros((len(chunk), len(label_to_idx)), dtype=torch.float32)
             for row_idx, labels_for_bgc in enumerate(chunk["bgc_class_list"].tolist()):
                 for label in labels_for_bgc:
@@ -815,6 +921,7 @@ def _attach_split_column(
     df: pd.DataFrame,
     splits_path: str | Path | None,
     cv_fold: int | None,
+    val_fold: int | None = None,
 ) -> pd.DataFrame:
     out = df.copy()
     if "split" in out.columns:
@@ -840,7 +947,12 @@ def _attach_split_column(
         split_df["fold_id"] = pd.to_numeric(split_df["fold_id"], errors="coerce")
         if bool(split_df["fold_id"].isna().any()):
             raise ValueError(f"Invalid fold_id values found in {splits_path}")
-        split_df["split"] = np.where(split_df["fold_id"].astype(int) == int(cv_fold), "test", "train")
+        fold_ids = split_df["fold_id"].astype(int)
+        split_df["split"] = np.where(
+            fold_ids == int(cv_fold),
+            "test",
+            np.where(fold_ids == int(val_fold), "val", "train") if val_fold is not None else "train",
+        )
     else:
         raise ValueError(f"Split file must contain either split or fold_id columns: {splits_path}")
     out["bgc_id"] = out["bgc_id"].astype(str)
@@ -870,7 +982,7 @@ def _require_rdkit() -> Any:
         from rdkit import Chem
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
-            "RDKit is required for compound_mw and origin_type downstream tasks. "
+            "RDKit is required for compound_mw, compound_logp, compound_tpsa, and origin_type downstream tasks. "
             "Please install rdkit, for example with `conda install -c conda-forge rdkit`."
         ) from exc
     return Chem
@@ -900,6 +1012,24 @@ def _safe_inchikey(smiles: str | float | None, chem_module: Any) -> str | None:
     return str(chem_module.MolToInchiKey(mol))
 
 
+def _safe_molecular_properties(smiles: str | float | None, chem_module: Any) -> dict[str, float | None]:
+    if smiles is None or (isinstance(smiles, float) and pd.isna(smiles)):
+        return {"compound_rdkit_mw": None, "compound_logp": None, "compound_tpsa": None}
+    text = str(smiles).strip()
+    if not text:
+        return {"compound_rdkit_mw": None, "compound_logp": None, "compound_tpsa": None}
+    mol = chem_module.MolFromSmiles(text)
+    if mol is None:
+        return {"compound_rdkit_mw": None, "compound_logp": None, "compound_tpsa": None}
+    from rdkit.Chem import Crippen, Descriptors, rdMolDescriptors
+
+    return {
+        "compound_rdkit_mw": float(Descriptors.MolWt(mol)),
+        "compound_logp": float(Crippen.MolLogP(mol)),
+        "compound_tpsa": float(rdMolDescriptors.CalcTPSA(mol)),
+    }
+
+
 def _first_unique_rows(df: pd.DataFrame, key: str) -> pd.DataFrame:
     valid = df.dropna(subset=[key]).copy()
     valid[key] = valid[key].astype(str).str.strip()
@@ -912,11 +1042,20 @@ def _prepare_compound_match_table(
     npatlas_path: str | Path,
     splits_path: str | Path | None,
     cv_fold: int | None,
+    val_fold: int | None,
     output_path: Path,
     force_rebuild: bool,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     if output_path.exists() and not force_rebuild:
         matched_df = pd.read_csv(output_path, sep="\t")
+        required_property_cols = {"compound_rdkit_mw", "compound_logp", "compound_tpsa"}
+        if not required_property_cols.issubset(matched_df.columns) and "smiles" in matched_df.columns:
+            chem = _require_rdkit()
+            properties = [_safe_molecular_properties(smiles, chem) for smiles in matched_df["smiles"].tolist()]
+            for col in sorted(required_property_cols):
+                if col not in matched_df.columns:
+                    matched_df[col] = [item[col] for item in properties]
+            matched_df.to_csv(output_path, sep="\t", index=False)
         total_mibig_rows = int(pd.read_csv(mibig_pairs_path, sep="\t", usecols=["bgc_id"]).shape[0])
         stats = {
             "total_mibig_rows": total_mibig_rows,
@@ -928,7 +1067,7 @@ def _prepare_compound_match_table(
 
     chem = _require_rdkit()
     mibig_df = pd.read_csv(mibig_pairs_path, sep="\t")
-    mibig_df = _attach_split_column(mibig_df, splits_path, cv_fold=cv_fold)
+    mibig_df = _attach_split_column(mibig_df, splits_path, cv_fold=cv_fold, val_fold=val_fold)
     compound_id_col = _infer_compound_id_column(mibig_df)
     mibig_df["bgc_id"] = mibig_df["bgc_id"].astype(str)
     mibig_df["compound_id"] = mibig_df[compound_id_col].astype(str)
@@ -978,6 +1117,7 @@ def _prepare_compound_match_table(
 
         if npatlas_row is None:
             continue
+        properties = _safe_molecular_properties(str(row.smiles), chem)
 
         matched_records.append(
             {
@@ -996,6 +1136,9 @@ def _prepare_compound_match_table(
                 "npatlas_compound_smiles": npatlas_row.get("compound_smiles"),
                 "npatlas_compound_inchikey": npatlas_row.get("compound_inchikey"),
                 "compound_molecular_weight": npatlas_row.get("compound_molecular_weight"),
+                "compound_rdkit_mw": properties["compound_rdkit_mw"],
+                "compound_logp": properties["compound_logp"],
+                "compound_tpsa": properties["compound_tpsa"],
                 "origin_type": npatlas_row.get("origin_type"),
             }
         )
@@ -1062,6 +1205,200 @@ def _log_split_sizes(task_name: str, split_frames: dict[str, pd.DataFrame]) -> N
     )
 
 
+def _build_bgc_split_assignments(
+    data_dir: str | Path,
+    splits_path: str | Path | None,
+    cv_fold: int | None,
+    val_fold: int | None,
+) -> pd.DataFrame:
+    interactions = build_interactions(data_dir, splits_path=splits_path, cv_fold=cv_fold, val_fold=val_fold)
+    assignments = interactions[["bgc_id", "split"]].drop_duplicates().copy()
+    assignments["bgc_id"] = assignments["bgc_id"].astype(str)
+    assignments["split"] = assignments["split"].astype(str).str.lower()
+    return assignments
+
+
+def _load_bioactivity_class_table(
+    data_dir: str | Path,
+    bioactivity_table_path: str | Path,
+    splits_path: str | Path | None,
+    cv_fold: int | None,
+    val_fold: int | None,
+) -> pd.DataFrame:
+    table_path = Path(bioactivity_table_path)
+    if not table_path.exists():
+        raise FileNotFoundError(
+            f"Bioactivity label table not found: {table_path}. "
+            "Create it with `python -m projects.mibig_bgc_np.scripts.create_eda_artifacts`."
+        )
+
+    bio_df = pd.read_csv(table_path)
+    required = {"bgc_id", "observed_bioactivities"}
+    missing = required.difference(bio_df.columns)
+    if missing:
+        raise ValueError(f"Bioactivity table {table_path} is missing columns: {sorted(missing)}")
+
+    bio_df = bio_df[["bgc_id", "observed_bioactivities"]].copy()
+    bio_df["bgc_id"] = bio_df["bgc_id"].astype(str)
+    bio_df["bgc_class_list"] = bio_df["observed_bioactivities"].fillna("").astype(str).map(
+        lambda text: [
+            label
+            for label in BIOACTIVITY_CLASS_NAMES
+            if label in {item.strip() for item in text.split(";") if item.strip()}
+        ]
+    )
+    bio_df = bio_df[bio_df["bgc_class_list"].map(len) > 0].copy()
+
+    assignments = _build_bgc_split_assignments(data_dir, splits_path=splits_path, cv_fold=cv_fold, val_fold=val_fold)
+    bio_df = bio_df.merge(assignments, on="bgc_id", how="inner")
+    return bio_df[["bgc_id", "split", "bgc_class_list"]].drop_duplicates(subset=["bgc_id", "split"]).reset_index(drop=True)
+
+
+def _bioactivity_dataset_stats(bio_df: pd.DataFrame) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "classes": BIOACTIVITY_CLASS_NAMES,
+        "n_rows": int(len(bio_df)),
+        "n_bgcs": int(bio_df["bgc_id"].nunique()) if not bio_df.empty else 0,
+        "split_rows": {},
+        "split_bgcs": {},
+        "class_bgcs": {},
+    }
+    for split, split_df in bio_df.groupby("split"):
+        stats["split_rows"][str(split)] = int(len(split_df))
+        stats["split_bgcs"][str(split)] = int(split_df["bgc_id"].nunique())
+    for class_name in BIOACTIVITY_CLASS_NAMES:
+        stats["class_bgcs"][class_name] = int(
+            bio_df[bio_df["bgc_class_list"].map(lambda labels, name=class_name: name in labels)]["bgc_id"].nunique()
+        )
+    return stats
+
+
+def _labels_from_semicolon_text(value: Any) -> list[str]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    return [label.strip() for label in str(value).split(";") if label.strip()]
+
+
+def _load_npclassifier_allowed_labels(
+    labels_df: pd.DataFrame,
+    *,
+    label_column: str,
+    counts_path: str | Path | None,
+    min_count: int | None,
+) -> list[str]:
+    if counts_path is None:
+        return sorted({label for value in labels_df[label_column].tolist() for label in _labels_from_semicolon_text(value)})
+
+    path = Path(counts_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"NPClassifier count table not found: {path}. "
+            "Create it with `python -m projects.mibig_bgc_np.scripts.create_downstream_distributions`."
+        )
+    counts_df = pd.read_csv(path)
+    required = {"label", "n_compounds"}
+    missing = required.difference(counts_df.columns)
+    if missing:
+        raise ValueError(f"NPClassifier count table {path} is missing columns: {sorted(missing)}")
+    threshold = int(min_count) if min_count is not None else 0
+    filtered = counts_df[pd.to_numeric(counts_df["n_compounds"], errors="coerce") > threshold].copy()
+    return [str(label) for label in filtered["label"].tolist()]
+
+
+def _load_npclassifier_bgc_label_table(
+    data_dir: str | Path,
+    npclassifier_pair_labels_path: str | Path,
+    *,
+    task_name: str,
+    splits_path: str | Path | None,
+    cv_fold: int | None,
+    val_fold: int | None,
+) -> tuple[pd.DataFrame, list[str], dict[str, Any]]:
+    if task_name not in NPCLASSIFIER_TASKS:
+        raise ValueError(f"Unsupported NPClassifier downstream task: {task_name}")
+    spec = NPCLASSIFIER_TASKS[task_name]
+    label_column = str(spec["label_column"])
+    table_path = Path(npclassifier_pair_labels_path)
+    if not table_path.exists():
+        raise FileNotFoundError(
+            f"NPClassifier pair label table not found: {table_path}. "
+            "Create it with `python -m projects.mibig_bgc_np.scripts.run_npclassifier`."
+        )
+
+    labels_df = pd.read_csv(table_path, sep="\t")
+    required = {"bgc_id", label_column}
+    missing = required.difference(labels_df.columns)
+    if missing:
+        raise ValueError(f"NPClassifier table {table_path} is missing columns: {sorted(missing)}")
+    labels_df = labels_df.copy()
+    labels_df["bgc_id"] = labels_df["bgc_id"].astype(str)
+
+    allowed_labels = _load_npclassifier_allowed_labels(
+        labels_df,
+        label_column=label_column,
+        counts_path=spec["counts_path"],
+        min_count=spec["min_count"],
+    )
+    if not allowed_labels:
+        raise ValueError(f"No labels selected for {task_name}. Check the NPClassifier count threshold.")
+    allowed_set = set(allowed_labels)
+
+    if splits_path is None and "split" not in labels_df.columns:
+        assignments = build_interactions(data_dir)[["bgc_id", "compound_id", "split"]].drop_duplicates().copy()
+        assignments["bgc_id"] = assignments["bgc_id"].astype(str)
+        assignments["compound_id"] = assignments["compound_id"].astype(str)
+        assignments["split"] = assignments["split"].astype(str).str.lower()
+        if "compound_id" not in labels_df.columns:
+            compound_id_col = _infer_compound_id_column(labels_df)
+            labels_df["compound_id"] = labels_df[compound_id_col].astype(str)
+        labels_df["compound_id"] = labels_df["compound_id"].astype(str)
+        labels_df = labels_df.merge(assignments, on=["bgc_id", "compound_id"], how="left")
+    else:
+        labels_df = _attach_split_column(labels_df, splits_path=splits_path, cv_fold=cv_fold, val_fold=val_fold)
+    labels_df = labels_df.dropna(subset=["split"]).copy()
+    labels_df["split"] = labels_df["split"].astype(str).str.lower()
+    labels_df["label_list"] = labels_df[label_column].map(
+        lambda value: [label for label in _labels_from_semicolon_text(value) if label in allowed_set]
+    )
+    labels_df = labels_df[labels_df["label_list"].map(len) > 0].copy()
+
+    rows: list[dict[str, Any]] = []
+    for (bgc_id, split), group in labels_df.groupby(["bgc_id", "split"], sort=True):
+        labels = sorted(
+            {label for labels_for_row in group["label_list"].tolist() for label in labels_for_row},
+            key=lambda label: allowed_labels.index(label),
+        )
+        if labels:
+            rows.append({"bgc_id": str(bgc_id), "split": str(split), "bgc_class_list": labels})
+    out = pd.DataFrame(rows, columns=["bgc_id", "split", "bgc_class_list"])
+
+    stats = {
+        "task": task_name,
+        "level": spec["level"],
+        "label_column": label_column,
+        "npclassifier_pair_labels_path": str(table_path),
+        "counts_path": str(spec["counts_path"]) if spec["counts_path"] is not None else None,
+        "min_count_exclusive": spec["min_count"],
+        "selected_labels": allowed_labels,
+        "n_selected_labels": int(len(allowed_labels)),
+        "n_pair_label_rows": int(len(labels_df)),
+        "n_rows": int(len(out)),
+        "n_bgcs": int(out["bgc_id"].nunique()) if not out.empty else 0,
+        "split_rows": {},
+        "split_bgcs": {},
+        "label_bgcs": {},
+    }
+    for split, split_df in out.groupby("split"):
+        stats["split_rows"][str(split)] = int(len(split_df))
+        stats["split_bgcs"][str(split)] = int(split_df["bgc_id"].nunique())
+    for label in allowed_labels:
+        stats["label_bgcs"][label] = int(
+            out[out["bgc_class_list"].map(lambda labels, name=label: name in labels)]["bgc_id"].nunique()
+        )
+
+    return out.reset_index(drop=True), allowed_labels, stats
+
+
 def _train_bgc_class_task(
     data_dir: str | Path,
     cache_dir: str | Path,
@@ -1071,13 +1408,18 @@ def _train_bgc_class_task(
     *,
     splits_path: str | Path | None,
     cv_fold: int | None,
+    val_fold: int | None,
     baseline_trials: int,
     class_names: list[str] | None,
     save_cm_png: bool,
     output_dir: Path,
 ) -> dict[str, Any]:
-    bgc_df = build_bgc_class_table(data_dir, splits_path=splits_path, cv_fold=cv_fold)
+    bgc_df = build_bgc_class_table(data_dir, splits_path=splits_path, cv_fold=cv_fold, val_fold=val_fold)
     bgc_cache = torch.load(Path(cache_dir) / "bgc_features.pt", map_location="cpu")
+    protein_path = Path(cache_dir) / "protein_positions.pt"
+    domain_path = Path(cache_dir) / "domain_positions.pt"
+    protein_positions = torch.load(protein_path, map_location="cpu", weights_only=True) if protein_path.exists() else None
+    domain_positions = torch.load(domain_path, map_location="cpu", weights_only=True) if domain_path.exists() else None
 
     split_frames = {
         split: bgc_df[bgc_df["split"] == split].reset_index(drop=True)
@@ -1119,6 +1461,8 @@ def _train_bgc_class_task(
         label_to_idx,
         device,
         int(cfg["downstream"]["feature_batch_size"]),
+        protein_positions,
+        domain_positions,
     )
     x_val, y_val = _build_bgc_multilabel_features(
         split_frames["val"],
@@ -1127,6 +1471,8 @@ def _train_bgc_class_task(
         label_to_idx,
         device,
         int(cfg["downstream"]["feature_batch_size"]),
+        protein_positions,
+        domain_positions,
     )
     x_test, y_test = _build_bgc_multilabel_features(
         split_frames["test"],
@@ -1135,6 +1481,8 @@ def _train_bgc_class_task(
         label_to_idx,
         device,
         int(cfg["downstream"]["feature_batch_size"]),
+        protein_positions,
+        domain_positions,
     )
 
     classifier = BGCClassifier(
@@ -1233,7 +1581,351 @@ def _train_bgc_class_task(
     return metrics
 
 
-def _train_compound_mw_task(
+def _train_bioactivity_class_task(
+    data_dir: str | Path,
+    cache_dir: str | Path,
+    cfg: dict[str, Any],
+    device: torch.device,
+    contrastive_model: DualEncoderCLIP,
+    *,
+    splits_path: str | Path | None,
+    cv_fold: int | None,
+    val_fold: int | None,
+    save_cm_png: bool,
+    output_dir: Path,
+    bioactivity_table_path: str | Path,
+) -> dict[str, Any]:
+    bio_df = _load_bioactivity_class_table(
+        data_dir=data_dir,
+        bioactivity_table_path=bioactivity_table_path,
+        splits_path=splits_path,
+        cv_fold=cv_fold,
+        val_fold=val_fold,
+    )
+    if bio_df.empty:
+        raise ValueError("No BGCs with the selected observed bioactivity classes were found in the selected splits.")
+
+    bgc_cache = torch.load(Path(cache_dir) / "bgc_features.pt", map_location="cpu")
+    protein_path = Path(cache_dir) / "protein_positions.pt"
+    domain_path = Path(cache_dir) / "domain_positions.pt"
+    protein_positions = torch.load(protein_path, map_location="cpu", weights_only=True) if protein_path.exists() else None
+    domain_positions = torch.load(domain_path, map_location="cpu", weights_only=True) if domain_path.exists() else None
+    split_frames = {
+        split: bio_df[bio_df["split"] == split].reset_index(drop=True)
+        for split in ("train", "val", "test")
+    }
+    _log_split_sizes("bioactivity_class", split_frames)
+    if split_frames["train"].empty:
+        raise ValueError("Training split is empty for bioactivity_class.")
+
+    label_to_idx = {label: idx for idx, label in enumerate(BIOACTIVITY_CLASS_NAMES)}
+    x_train, y_train = _build_bgc_multilabel_features(
+        split_frames["train"],
+        contrastive_model,
+        bgc_cache,
+        label_to_idx,
+        device,
+        int(cfg["downstream"]["feature_batch_size"]),
+        protein_positions,
+        domain_positions,
+    )
+    x_val, y_val = _build_bgc_multilabel_features(
+        split_frames["val"],
+        contrastive_model,
+        bgc_cache,
+        label_to_idx,
+        device,
+        int(cfg["downstream"]["feature_batch_size"]),
+        protein_positions,
+        domain_positions,
+    )
+    x_test, y_test = _build_bgc_multilabel_features(
+        split_frames["test"],
+        contrastive_model,
+        bgc_cache,
+        label_to_idx,
+        device,
+        int(cfg["downstream"]["feature_batch_size"]),
+        protein_positions,
+        domain_positions,
+    )
+
+    classifier = BGCClassifier(
+        emb_dim=int(cfg["model"]["emb_dim"]),
+        num_classes=len(BIOACTIVITY_CLASS_NAMES),
+        hidden_dim=int(cfg["downstream"]["hidden_dim"]),
+        dropout=float(cfg["downstream"]["dropout"]),
+    ).to(device)
+    optimizer = AdamW(
+        classifier.parameters(),
+        lr=float(cfg["downstream"]["lr"]),
+        weight_decay=float(cfg["downstream"]["weight_decay"]),
+    )
+    pos_counts = y_train.sum(dim=0)
+    neg_counts = y_train.size(0) - pos_counts
+    pos_weight = torch.where(pos_counts > 0, neg_counts / pos_counts.clamp_min(1.0), torch.ones_like(pos_counts))
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+
+    train_loader = DataLoader(
+        TensorDataset(x_train, y_train),
+        batch_size=int(cfg["downstream"]["batch_size"]),
+        shuffle=True,
+    )
+    val_loader = DataLoader(TensorDataset(x_val, y_val), batch_size=int(cfg["downstream"]["batch_size"]), shuffle=False)
+    test_loader = DataLoader(TensorDataset(x_test, y_test), batch_size=int(cfg["downstream"]["batch_size"]), shuffle=False)
+
+    for _ in tqdm(range(int(cfg["downstream"]["epochs"])), desc="Training bioactivity_class", leave=False):
+        classifier.train()
+        for x, y in train_loader:
+            x = x.to(device)
+            y = y.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            logits = classifier(x)
+            loss = loss_fn(logits, y)
+            loss.backward()
+            optimizer.step()
+
+    metrics: dict[str, Any] = {
+        "label_vocab": BIOACTIVITY_CLASS_NAMES,
+        "class_names": BIOACTIVITY_CLASS_NAMES,
+        "target_protocol": "observed_true_only_selected_classes",
+        "bioactivity_table_path": str(bioactivity_table_path),
+        "dataset_stats": _bioactivity_dataset_stats(bio_df),
+        "loss": {
+            "name": "BCEWithLogitsLoss",
+            "pos_weight": [float(value) for value in pos_weight.cpu().tolist()],
+        },
+    }
+    for split_name, loader in {"val": val_loader, "test": test_loader}.items():
+        if len(loader.dataset) == 0:
+            continue
+        metrics[split_name] = _multilabel_classification_report(
+            classifier=classifier,
+            loader=loader,
+            device=device,
+            class_names=BIOACTIVITY_CLASS_NAMES,
+        )
+
+    if save_cm_png:
+        for split_name in ("val", "test"):
+            if split_name not in metrics:
+                continue
+            split_report = metrics[split_name]
+            _save_named_confusion_matrix_png(
+                split_report["confusion_matrix"],
+                BIOACTIVITY_CLASS_NAMES,
+                output_dir / f"downstream_bioactivity_confusion_matrix_{split_name}_all_bgcs.png",
+                title=f"Expanded-label confusion matrix ({split_name}, observed bioactivity)",
+            )
+            _save_named_confusion_matrix_png(
+                split_report["confusion_matrix_single_class_only"],
+                BIOACTIVITY_CLASS_NAMES,
+                output_dir / f"downstream_bioactivity_confusion_matrix_{split_name}_single_class_bgcs.png",
+                title=f"Expanded-label confusion matrix ({split_name}, single-bioactivity BGCs only)",
+            )
+            _save_multilabel_roc_curve_png(
+                split_report,
+                output_dir / f"downstream_bioactivity_roc_curve_{split_name}.png",
+                title=f"ROC Curve for Bioactivity Prediction ({split_name})",
+            )
+            for class_name in BIOACTIVITY_CLASS_NAMES:
+                _save_named_confusion_matrix_png(
+                    split_report["per_class_binary"][class_name]["confusion_matrix"],
+                    ["negative", "positive"],
+                    output_dir / f"downstream_bioactivity_confusion_matrix_{split_name}_class_{_slugify_label(class_name)}.png",
+                    title=f"One-vs-rest confusion matrix ({split_name}, bioactivity={class_name})",
+                )
+
+    torch.save(
+        {
+            "classifier_state_dict": classifier.state_dict(),
+            "metrics": metrics,
+            "label_vocab": BIOACTIVITY_CLASS_NAMES,
+        },
+        output_dir / "downstream_bioactivity_classifier.pt",
+    )
+    save_json(metrics, output_dir / "downstream_bioactivity_metrics.json")
+    save_json(metrics["dataset_stats"], output_dir / "downstream_bioactivity_dataset_stats.json")
+    return metrics
+
+
+def _train_npclassifier_multilabel_task(
+    task_name: str,
+    data_dir: str | Path,
+    cache_dir: str | Path,
+    cfg: dict[str, Any],
+    device: torch.device,
+    contrastive_model: DualEncoderCLIP,
+    *,
+    splits_path: str | Path | None,
+    cv_fold: int | None,
+    val_fold: int | None,
+    save_cm_png: bool,
+    output_dir: Path,
+    npclassifier_pair_labels_path: str | Path,
+) -> dict[str, Any]:
+    if task_name not in NPCLASSIFIER_TASKS:
+        raise ValueError(f"Unsupported NPClassifier downstream task: {task_name}")
+    spec = NPCLASSIFIER_TASKS[task_name]
+    level = str(spec["level"])
+    display_name = str(spec["display_name"])
+    target_df, label_vocab, dataset_stats = _load_npclassifier_bgc_label_table(
+        data_dir=data_dir,
+        npclassifier_pair_labels_path=npclassifier_pair_labels_path,
+        task_name=task_name,
+        splits_path=splits_path,
+        cv_fold=cv_fold,
+        val_fold=val_fold,
+    )
+    if target_df.empty:
+        raise ValueError(f"No BGCs with selected {display_name} labels were found in the selected splits.")
+
+    bgc_cache = torch.load(Path(cache_dir) / "bgc_features.pt", map_location="cpu")
+    protein_path = Path(cache_dir) / "protein_positions.pt"
+    domain_path = Path(cache_dir) / "domain_positions.pt"
+    protein_positions = torch.load(protein_path, map_location="cpu", weights_only=True) if protein_path.exists() else None
+    domain_positions = torch.load(domain_path, map_location="cpu", weights_only=True) if domain_path.exists() else None
+    split_frames = {
+        split: target_df[target_df["split"] == split].reset_index(drop=True)
+        for split in ("train", "val", "test")
+    }
+    _log_split_sizes(task_name, split_frames)
+    if split_frames["train"].empty:
+        raise ValueError(f"Training split is empty for {task_name}.")
+
+    label_to_idx = {label: idx for idx, label in enumerate(label_vocab)}
+    x_train, y_train = _build_bgc_multilabel_features(
+        split_frames["train"],
+        contrastive_model,
+        bgc_cache,
+        label_to_idx,
+        device,
+        int(cfg["downstream"]["feature_batch_size"]),
+        protein_positions,
+        domain_positions,
+    )
+    x_val, y_val = _build_bgc_multilabel_features(
+        split_frames["val"],
+        contrastive_model,
+        bgc_cache,
+        label_to_idx,
+        device,
+        int(cfg["downstream"]["feature_batch_size"]),
+        protein_positions,
+        domain_positions,
+    )
+    x_test, y_test = _build_bgc_multilabel_features(
+        split_frames["test"],
+        contrastive_model,
+        bgc_cache,
+        label_to_idx,
+        device,
+        int(cfg["downstream"]["feature_batch_size"]),
+        protein_positions,
+        domain_positions,
+    )
+
+    classifier = BGCClassifier(
+        emb_dim=int(cfg["model"]["emb_dim"]),
+        num_classes=len(label_vocab),
+        hidden_dim=int(cfg["downstream"]["hidden_dim"]),
+        dropout=float(cfg["downstream"]["dropout"]),
+    ).to(device)
+    optimizer = AdamW(
+        classifier.parameters(),
+        lr=float(cfg["downstream"]["lr"]),
+        weight_decay=float(cfg["downstream"]["weight_decay"]),
+    )
+    pos_counts = y_train.sum(dim=0)
+    neg_counts = y_train.size(0) - pos_counts
+    pos_weight = torch.where(pos_counts > 0, neg_counts / pos_counts.clamp_min(1.0), torch.ones_like(pos_counts))
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+
+    train_loader = DataLoader(
+        TensorDataset(x_train, y_train),
+        batch_size=int(cfg["downstream"]["batch_size"]),
+        shuffle=True,
+    )
+    val_loader = DataLoader(TensorDataset(x_val, y_val), batch_size=int(cfg["downstream"]["batch_size"]), shuffle=False)
+    test_loader = DataLoader(TensorDataset(x_test, y_test), batch_size=int(cfg["downstream"]["batch_size"]), shuffle=False)
+
+    for _ in tqdm(range(int(cfg["downstream"]["epochs"])), desc=f"Training {task_name}", leave=False):
+        classifier.train()
+        for x, y in train_loader:
+            x = x.to(device)
+            y = y.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            logits = classifier(x)
+            loss = loss_fn(logits, y)
+            loss.backward()
+            optimizer.step()
+
+    metrics: dict[str, Any] = {
+        "label_vocab": label_vocab,
+        "class_names": label_vocab,
+        "target_protocol": f"npclassifier_{level}_selected_labels",
+        "dataset_stats": dataset_stats,
+        "loss": {
+            "name": "BCEWithLogitsLoss",
+            "pos_weight": [float(value) for value in pos_weight.cpu().tolist()],
+        },
+    }
+    for split_name, loader in {"val": val_loader, "test": test_loader}.items():
+        if len(loader.dataset) == 0:
+            continue
+        metrics[split_name] = _multilabel_classification_report(
+            classifier=classifier,
+            loader=loader,
+            device=device,
+            class_names=label_vocab,
+        )
+
+    file_prefix = f"downstream_npclassifier_{level}"
+    if save_cm_png:
+        for split_name in ("val", "test"):
+            if split_name not in metrics:
+                continue
+            split_report = metrics[split_name]
+            _save_named_confusion_matrix_png(
+                split_report["confusion_matrix"],
+                label_vocab,
+                output_dir / f"{file_prefix}_confusion_matrix_{split_name}_all_bgcs.png",
+                title=f"Expanded-label confusion matrix ({split_name}, {display_name})",
+            )
+            _save_named_confusion_matrix_png(
+                split_report["confusion_matrix_single_class_only"],
+                label_vocab,
+                output_dir / f"{file_prefix}_confusion_matrix_{split_name}_single_class_bgcs.png",
+                title=f"Expanded-label confusion matrix ({split_name}, single-label BGCs only)",
+            )
+            _save_multilabel_roc_curve_png(
+                split_report,
+                output_dir / f"{file_prefix}_roc_curve_{split_name}.png",
+                title=f"ROC Curve for {display_name} Prediction ({split_name})",
+            )
+            for class_name in label_vocab:
+                _save_named_confusion_matrix_png(
+                    split_report["per_class_binary"][class_name]["confusion_matrix"],
+                    ["negative", "positive"],
+                    output_dir / f"{file_prefix}_confusion_matrix_{split_name}_class_{_slugify_label(class_name)}.png",
+                    title=f"One-vs-rest confusion matrix ({split_name}, {level}={class_name})",
+                )
+
+    torch.save(
+        {
+            "classifier_state_dict": classifier.state_dict(),
+            "metrics": metrics,
+            "label_vocab": label_vocab,
+        },
+        output_dir / f"{file_prefix}_classifier.pt",
+    )
+    save_json(metrics, output_dir / f"{file_prefix}_metrics.json")
+    save_json(metrics["dataset_stats"], output_dir / f"{file_prefix}_dataset_stats.json")
+    return metrics
+
+
+def _train_compound_property_regression_task(
+    task_name: str,
     matched_df: pd.DataFrame,
     embedding_map: dict[str, torch.Tensor],
     cfg: dict[str, Any],
@@ -1242,40 +1934,54 @@ def _train_compound_mw_task(
     baseline_trials: int,
     mw_bins: int,
 ) -> dict[str, Any]:
-    task_df = matched_df.dropna(subset=["compound_molecular_weight"]).copy()
-    task_df["compound_molecular_weight"] = pd.to_numeric(task_df["compound_molecular_weight"], errors="coerce")
-    task_df = task_df.dropna(subset=["compound_molecular_weight"]).reset_index(drop=True)
-    if task_df.empty:
-        raise ValueError("No matched compounds with non-null compound_molecular_weight were found.")
+    if task_name not in COMPOUND_REGRESSION_TASKS:
+        raise ValueError(f"Unsupported compound regression task: {task_name}")
+    spec = COMPOUND_REGRESSION_TASKS[task_name]
+    target_col = str(spec["target"])
+    short_name = str(spec["short_name"])
 
-    _save_histogram(task_df["compound_molecular_weight"], bins=mw_bins, path=output_dir / "downstream_mw_hist.png")
+    task_df = matched_df.dropna(subset=[target_col]).copy()
+    task_df[target_col] = pd.to_numeric(task_df[target_col], errors="coerce")
+    task_df = task_df.dropna(subset=[target_col]).reset_index(drop=True)
+    if task_df.empty:
+        raise ValueError(f"No matched compounds with non-null {target_col} were found.")
+
+    _save_histogram(
+        task_df[target_col],
+        bins=mw_bins,
+        path=output_dir / f"downstream_{short_name}_hist.png",
+        title=str(spec["hist_title"]),
+        xlabel=str(spec["x_label"]),
+    )
     exploded_classes = _explode_bgc_classes(task_df)
-    _save_grouped_mw_boxplot(
+    _save_grouped_property_boxplot(
         exploded_classes,
         group_col="bgc_class_single",
-        value_col="compound_molecular_weight",
-        title="Molecular weight distribution by BGC class",
-        path=output_dir / "downstream_mw_by_bgc_class.png",
+        value_col=target_col,
+        title=f"{spec['display_name']} distribution by BGC class",
+        path=output_dir / f"downstream_{short_name}_by_bgc_class.png",
+        ylabel=str(spec["boxplot_ylabel"]),
     )
-    _save_grouped_mw_boxplot(
+    _save_grouped_property_boxplot(
         task_df.dropna(subset=["origin_type"]).copy(),
         group_col="origin_type",
-        value_col="compound_molecular_weight",
-        title="Molecular weight distribution by origin type",
-        path=output_dir / "downstream_mw_by_origin_type.png",
+        value_col=target_col,
+        title=f"{spec['display_name']} distribution by origin type",
+        path=output_dir / f"downstream_{short_name}_by_origin_type.png",
+        ylabel=str(spec["boxplot_ylabel"]),
     )
 
     split_frames = {
         split: task_df[task_df["split"] == split].reset_index(drop=True)
         for split in ("train", "val", "test")
     }
-    _log_split_sizes("compound_mw", split_frames)
+    _log_split_sizes(task_name, split_frames)
     if split_frames["train"].empty:
-        raise ValueError("Training split is empty for compound_mw.")
+        raise ValueError(f"Training split is empty for {task_name}.")
 
-    x_train, y_train = _frame_to_tensor_dataset(split_frames["train"], embedding_map, "compound_molecular_weight", torch.float32)
-    x_val, y_val = _frame_to_tensor_dataset(split_frames["val"], embedding_map, "compound_molecular_weight", torch.float32)
-    x_test, y_test = _frame_to_tensor_dataset(split_frames["test"], embedding_map, "compound_molecular_weight", torch.float32)
+    x_train, y_train = _frame_to_tensor_dataset(split_frames["train"], embedding_map, target_col, torch.float32)
+    x_val, y_val = _frame_to_tensor_dataset(split_frames["val"], embedding_map, target_col, torch.float32)
+    x_test, y_test = _frame_to_tensor_dataset(split_frames["test"], embedding_map, target_col, torch.float32)
 
     regressor = EmbeddingRegressor(
         emb_dim=int(cfg["model"]["emb_dim"]),
@@ -1297,7 +2003,7 @@ def _train_compound_mw_task(
     val_loader = DataLoader(TensorDataset(x_val, y_val), batch_size=int(cfg["downstream"]["batch_size"]), shuffle=False)
     test_loader = DataLoader(TensorDataset(x_test, y_test), batch_size=int(cfg["downstream"]["batch_size"]), shuffle=False)
 
-    for _ in tqdm(range(int(cfg["downstream"]["epochs"])), desc="Training compound_mw", leave=False):
+    for _ in tqdm(range(int(cfg["downstream"]["epochs"])), desc=f"Training {task_name}", leave=False):
         regressor.train()
         for x, y in train_loader:
             x = x.to(device)
@@ -1310,7 +2016,8 @@ def _train_compound_mw_task(
 
     baseline_seed = int(cfg.get("seed", 42))
     metrics: dict[str, Any] = {
-        "target": "compound_molecular_weight",
+        "target": target_col,
+        "display_name": str(spec["display_name"]),
         "histogram_bins": int(mw_bins),
         "match_counts": {
             "final_dataset_size": int(len(task_df)),
@@ -1337,9 +2044,9 @@ def _train_compound_mw_task(
             "regressor_state_dict": regressor.state_dict(),
             "metrics": metrics,
         },
-        output_dir / "downstream_compound_mw_regressor.pt",
+        output_dir / f"downstream_{task_name}_regressor.pt",
     )
-    save_json(metrics, output_dir / "downstream_compound_mw_metrics.json")
+    save_json(metrics, output_dir / f"downstream_{task_name}_metrics.json")
     return metrics
 
 
@@ -1530,12 +2237,15 @@ def train_downstream(
     *,
     splits_path: str | Path | None = None,
     cv_fold: int | None = None,
+    val_fold: int | None = None,
     baseline_trials: int = 100,
     class_names: list[str] | None = None,
     save_cm_png: bool = False,
     tasks: list[str] | tuple[str, ...] | None = None,
     npatlas_path: str | Path = "data/NPAtlas_download_2024_09.tsv",
     mibig_pairs_path: str | Path = "data/MIBIG/processed/mibig_pairs.tsv",
+    bioactivity_table_path: str | Path = "results/EDA/bgc_observed_bioactivities.csv",
+    npclassifier_pair_labels_path: str | Path = "data/MIBIG/processed/mibig_pairs_npclassifier_labels.tsv",
     mw_bins: int = 50,
     force_rebuild_match: bool = False,
 ) -> dict[str, Any]:
@@ -1561,6 +2271,7 @@ def train_downstream(
             npatlas_path=npatlas_path,
             splits_path=splits_path,
             cv_fold=cv_fold,
+            val_fold=val_fold,
             output_path=matched_path,
             force_rebuild=force_rebuild_match,
         )
@@ -1574,7 +2285,7 @@ def train_downstream(
             compound_match_stats["total_matched_rows"],
         )
 
-        interactions = build_interactions(data_dir, splits_path=splits_path, cv_fold=cv_fold)
+        interactions = build_interactions(data_dir, splits_path=splits_path, cv_fold=cv_fold, val_fold=val_fold)
         valid_pairs = interactions[["bgc_id", "compound_id", "split"]].drop_duplicates().copy()
         valid_pairs["bgc_id"] = valid_pairs["bgc_id"].astype(str)
         valid_pairs["compound_id"] = valid_pairs["compound_id"].astype(str)
@@ -1609,15 +2320,46 @@ def train_downstream(
                 contrastive_model=contrastive_model,
                 splits_path=splits_path,
                 cv_fold=cv_fold,
+                val_fold=val_fold,
                 baseline_trials=baseline_trials,
                 class_names=class_names,
                 save_cm_png=save_cm_png,
                 output_dir=outdir,
             )
-        elif task == "compound_mw":
+        elif task == "bioactivity_class":
+            results[task] = _train_bioactivity_class_task(
+                data_dir=data_dir,
+                cache_dir=cache_dir,
+                cfg=cfg,
+                device=device,
+                contrastive_model=contrastive_model,
+                splits_path=splits_path,
+                cv_fold=cv_fold,
+                val_fold=val_fold,
+                save_cm_png=save_cm_png,
+                output_dir=outdir,
+                bioactivity_table_path=bioactivity_table_path,
+            )
+        elif task in NPCLASSIFIER_TASKS:
+            results[task] = _train_npclassifier_multilabel_task(
+                task_name=task,
+                data_dir=data_dir,
+                cache_dir=cache_dir,
+                cfg=cfg,
+                device=device,
+                contrastive_model=contrastive_model,
+                splits_path=splits_path,
+                cv_fold=cv_fold,
+                val_fold=val_fold,
+                save_cm_png=save_cm_png,
+                output_dir=outdir,
+                npclassifier_pair_labels_path=npclassifier_pair_labels_path,
+            )
+        elif task in COMPOUND_REGRESSION_TASKS:
             if matched_df is None or compound_embeddings is None or compound_match_stats is None:
-                raise RuntimeError("Compound match state is missing for compound_mw.")
-            results[task] = _train_compound_mw_task(
+                raise RuntimeError(f"Compound match state is missing for {task}.")
+            results[task] = _train_compound_property_regression_task(
+                task_name=task,
                 matched_df=matched_df,
                 embedding_map=compound_embeddings,
                 cfg=cfg,

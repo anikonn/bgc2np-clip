@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from projects.mibig_bgc_np.scripts.run_bgcmac_ensemble import (
     _parse_label_text,
     _train_raw_bgc_baseline_member,
 )
+from projects.mibig_bgc_np.models.clip_dual import DualEncoderCLIP
 from projects.mibig_bgc_np.training.contrastive_trainer import (
     evaluate_split_bgc_class_retrieval,
     evaluate_split_retrieval,
@@ -40,8 +42,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--override", nargs="*", default=[])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n_folds", type=int, default=10)
+    parser.add_argument(
+        "--fold_ids",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional subset of 1-based fold IDs to run. By default all folds 1..n_folds are run. "
+            "The summary keeps n_folds as the split definition and records n_run_folds separately."
+        ),
+    )
     parser.add_argument("--split_type", choices=("bgc", "combined", "np", "strict"), default="combined")
     parser.add_argument("--splits_path", type=str, default=None)
+    parser.add_argument(
+        "--validation_strategy",
+        choices=("next_fold", "none"),
+        default="next_fold",
+        help=(
+            "How to select validation data for fold_id-only CV splits. "
+            "'next_fold' uses fold k+1 cyclically as validation; 'none' keeps the old train/test-only behavior."
+        ),
+    )
     parser.add_argument(
         "--run_name",
         type=str,
@@ -88,6 +109,27 @@ def parse_args() -> argparse.Namespace:
         dest="save_cm_png",
         action="store_false",
         help="Disable per-fold downstream confusion matrices, ROC plots, and aggregate CV confusion plots.",
+    )
+    parser.add_argument(
+        "--retrieval_only",
+        action="store_true",
+        help=(
+            "Run contrastive training and global retrieval evaluation only. "
+            "Skip downstream prediction, class-retrieval plots, and raw-feature classifier baselines."
+        ),
+    )
+    parser.add_argument(
+        "--reuse_checkpoints",
+        action="store_true",
+        help=(
+            "Reuse each fold's existing contrastive_model_best.pt and contrastive_metrics.json, "
+            "then run the requested evaluations/downstream tasks without retraining CLIP."
+        ),
+    )
+    parser.add_argument(
+        "--no_linear_projection_baseline",
+        action="store_true",
+        help="Run the Random, frozen-feature, and KNN retrieval baselines without the trained linear baseline.",
     )
     return parser.parse_args()
 
@@ -211,11 +253,10 @@ def _build_raw_classifier_bgc_table(
     data_dir: str | Path,
     splits_path: str | Path,
     cv_fold: int,
-    n_folds: int,
+    val_fold: int | None,
 ) -> pd.DataFrame:
-    bgc_df = build_bgc_class_table(data_dir, splits_path=splits_path, cv_fold=cv_fold).copy()
-    if "val" not in set(bgc_df["split"].astype(str).str.lower()) and "fold_id" in bgc_df.columns:
-        val_fold = (int(cv_fold) % int(n_folds)) + 1
+    bgc_df = build_bgc_class_table(data_dir, splits_path=splits_path, cv_fold=cv_fold, val_fold=val_fold).copy()
+    if val_fold is not None and "val" not in set(bgc_df["split"].astype(str).str.lower()) and "fold_id" in bgc_df.columns:
         bgc_df["fold_id"] = pd.to_numeric(bgc_df["fold_id"], errors="coerce")
         bgc_df["split"] = np.where(
             bgc_df["fold_id"] == int(cv_fold),
@@ -226,6 +267,34 @@ def _build_raw_classifier_bgc_table(
     if "bgc_class_list" not in bgc_df.columns:
         bgc_df["bgc_class_list"] = bgc_df["bgc_classes"].map(_parse_label_text)
     return bgc_df[bgc_df["bgc_class_list"].map(len) > 0].copy()
+
+
+def _select_validation_fold(test_fold: int, n_folds: int, strategy: str) -> int | None:
+    if strategy == "none":
+        return None
+    if strategy == "next_fold":
+        return (int(test_fold) % int(n_folds)) + 1
+    raise ValueError(f"Unknown validation strategy: {strategy}")
+
+
+def _load_fold_model(checkpoint_path: Path, device: torch.device) -> tuple[DualEncoderCLIP, dict[str, Any]]:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint_cfg = checkpoint["config"]
+    model = DualEncoderCLIP(
+        bgc_input_dim=int(checkpoint["bgc_input_dim"]),
+        compound_input_dim=int(checkpoint["compound_input_dim"]),
+        emb_dim=int(checkpoint_cfg["model"]["emb_dim"]),
+        hidden_dim=int(checkpoint_cfg["model"]["hidden_dim"]),
+        dropout=float(checkpoint_cfg["model"]["dropout"]),
+        init_temperature=float(checkpoint_cfg["model"]["init_temperature"]),
+        max_logit_scale=float(checkpoint_cfg["model"]["max_logit_scale"]),
+        bgc_aggregation=str(checkpoint_cfg["model"].get("bgc_aggregation", "prepooled")),
+        bgc_aggregation_config=dict(checkpoint_cfg["model"].get("bgc_aggregation_config", {})),
+        projection_head=str(checkpoint_cfg["model"].get("projection_head", "mlp_gelu")),
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model, checkpoint_cfg
 
 
 def _build_summary(fold_summaries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -286,6 +355,15 @@ def main() -> None:
         splits_path=args.splits_path,
     )
     split_df = _load_cv_assignments(splits_path, n_folds=int(args.n_folds))
+    if int(args.n_folds) < 2 and str(args.validation_strategy) != "none":
+        raise ValueError("--validation_strategy next_fold requires at least two folds.")
+    if args.fold_ids is None or len(args.fold_ids) == 0:
+        fold_ids = list(range(1, int(args.n_folds) + 1))
+    else:
+        fold_ids = sorted({int(value) for value in args.fold_ids})
+        bad_fold_ids = [value for value in fold_ids if value < 1 or value > int(args.n_folds)]
+        if bad_fold_ids:
+            raise ValueError(f"--fold_ids must be within 1..{args.n_folds}; got {bad_fold_ids}")
 
     run_name = str(args.run_name) if args.run_name is not None else f"{args.split_type}_cv{args.n_folds}"
     root_outdir = Path("results") / run_name
@@ -293,7 +371,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     fold_summaries: list[dict[str, Any]] = []
-    for fold_id in range(1, int(args.n_folds) + 1):
+    for fold_id in fold_ids:
         fold_outdir = root_outdir / f"fold_{fold_id}"
         fold_outdir.mkdir(parents=True, exist_ok=True)
 
@@ -301,19 +379,34 @@ def main() -> None:
         fold_cfg["output"]["dir"] = str(fold_outdir)
         set_seed(int(args.seed))
 
-        logger.info("Starting fold %d/%d", fold_id, args.n_folds)
-        interactions = build_interactions(args.data_dir, splits_path=splits_path, cv_fold=fold_id)
+        val_fold = _select_validation_fold(fold_id, int(args.n_folds), str(args.validation_strategy))
+        logger.info("Starting fold %d/%d with validation fold %s", fold_id, args.n_folds, val_fold)
+        interactions = build_interactions(args.data_dir, splits_path=splits_path, cv_fold=fold_id, val_fold=val_fold)
         counts = _split_counts(interactions)
         logger.info("Fold %d counts: %s", fold_id, counts)
 
-        model, contrastive_metrics, _ = train_contrastive(
-            data_dir=args.data_dir,
-            cache_dir=args.cache_dir,
-            cfg=fold_cfg,
-            device=device,
-            splits_path=splits_path,
-            cv_fold=fold_id,
-        )
+        checkpoint_path = fold_outdir / "contrastive_model_best.pt"
+        metrics_path = fold_outdir / "contrastive_metrics.json"
+        if bool(args.reuse_checkpoints):
+            if not checkpoint_path.exists() or not metrics_path.exists():
+                raise FileNotFoundError(
+                    f"Cannot reuse fold {fold_id}: expected {checkpoint_path} and {metrics_path}"
+                )
+            model, checkpoint_cfg = _load_fold_model(checkpoint_path, device)
+            fold_cfg = copy.deepcopy(checkpoint_cfg)
+            fold_cfg["output"]["dir"] = str(fold_outdir)
+            contrastive_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            logger.info("Reused fold %d checkpoint from %s", fold_id, checkpoint_path)
+        else:
+            model, contrastive_metrics, _ = train_contrastive(
+                data_dir=args.data_dir,
+                cache_dir=args.cache_dir,
+                cfg=fold_cfg,
+                device=device,
+                splits_path=splits_path,
+                cv_fold=fold_id,
+                val_fold=val_fold,
+            )
 
         retrieval_test = evaluate_split_retrieval(
             model=model,
@@ -326,20 +419,22 @@ def main() -> None:
         )
         save_json(retrieval_test, fold_outdir / "retrieval_test.json")
 
-        retrieval_class_test = evaluate_split_bgc_class_retrieval(
-            model=model,
-            interactions=interactions,
-            split="test",
-            bgc_cache_path=Path(args.cache_dir) / "bgc_features.pt",
-            compound_cache_path=Path(args.cache_dir) / "compound_features.pt",
-            device=device,
-        )
-        retrieval_class_test["plots"] = save_bgc_class_retrieval_plots(
-            retrieval_class_test,
-            fold_outdir,
-            prefix="test",
-        ) if bool(args.save_cm_png) else []
-        save_json(retrieval_class_test, fold_outdir / "retrieval_class_test.json")
+        retrieval_class_test: dict[str, Any] = {}
+        if not bool(args.retrieval_only):
+            retrieval_class_test = evaluate_split_bgc_class_retrieval(
+                model=model,
+                interactions=interactions,
+                split="test",
+                bgc_cache_path=Path(args.cache_dir) / "bgc_features.pt",
+                compound_cache_path=Path(args.cache_dir) / "compound_features.pt",
+                device=device,
+            )
+            retrieval_class_test["plots"] = save_bgc_class_retrieval_plots(
+                retrieval_class_test,
+                fold_outdir,
+                prefix="test",
+            ) if bool(args.save_cm_png) else []
+            save_json(retrieval_class_test, fold_outdir / "retrieval_class_test.json")
 
         retrieval_baselines_test: dict[str, Any] = {}
         if bool(args.retrieval_baselines):
@@ -353,26 +448,30 @@ def main() -> None:
                 seed=int(args.seed) + int(fold_id),
                 random_trials=int(args.baseline_random_trials),
                 k_values=[int(k) for k in args.baseline_k_values],
+                include_linear=not bool(args.no_linear_projection_baseline),
             )
 
-        downstream_metrics = train_downstream(
-            data_dir=args.data_dir,
-            cache_dir=args.cache_dir,
-            contrastive_ckpt=fold_outdir / "contrastive_model_best.pt",
-            cfg=fold_cfg,
-            device=device,
-            splits_path=splits_path,
-            cv_fold=fold_id,
-            save_cm_png=bool(args.save_cm_png),
-        )
+        downstream_metrics: dict[str, Any] = {}
+        if not bool(args.retrieval_only):
+            downstream_metrics = train_downstream(
+                data_dir=args.data_dir,
+                cache_dir=args.cache_dir,
+                contrastive_ckpt=fold_outdir / "contrastive_model_best.pt",
+                cfg=fold_cfg,
+                device=device,
+                splits_path=splits_path,
+                cv_fold=fold_id,
+                val_fold=val_fold,
+                save_cm_png=bool(args.save_cm_png),
+            )
 
         raw_bgc_classifier_baseline: dict[str, Any] = {}
-        if bool(args.raw_bgc_classifier_baseline):
+        if bool(args.raw_bgc_classifier_baseline) and not bool(args.retrieval_only):
             raw_bgc_df = _build_raw_classifier_bgc_table(
                 data_dir=args.data_dir,
                 splits_path=splits_path,
                 cv_fold=int(fold_id),
-                n_folds=int(args.n_folds),
+                val_fold=val_fold,
             )
             bgc_cache = torch.load(Path(args.cache_dir) / "bgc_features.pt", map_location="cpu")
             _, raw_bgc_classifier_baseline = _train_raw_bgc_baseline_member(
@@ -385,6 +484,7 @@ def main() -> None:
 
         fold_summary = {
             "fold_id": int(fold_id),
+            "val_fold": int(val_fold) if val_fold is not None else None,
             "output_dir": str(fold_outdir),
             "counts": counts,
             "contrastive_metrics": contrastive_metrics,
@@ -400,6 +500,11 @@ def main() -> None:
     summary = {
         "seed": int(args.seed),
         "n_folds": int(args.n_folds),
+        "fold_ids": [int(value) for value in fold_ids],
+        "n_run_folds": int(len(fold_ids)),
+        "validation_strategy": str(args.validation_strategy),
+        "retrieval_only": bool(args.retrieval_only),
+        "reused_checkpoints": bool(args.reuse_checkpoints),
         "data_dir": str(args.data_dir),
         "cache_dir": str(args.cache_dir),
         "splits_path": str(splits_path),
@@ -419,7 +524,7 @@ def main() -> None:
     save_json(summary, summary_path)
     logger.info("Saved CV summary to %s", summary_path)
 
-    if bool(args.raw_bgc_classifier_baseline):
+    if bool(args.raw_bgc_classifier_baseline) and not bool(args.retrieval_only):
         raw_baseline_summary = _build_raw_classifier_baseline_summary(fold_summaries)
         raw_baseline_summary_path = root_outdir / "raw_bgc_classifier_baseline_summary.json"
         save_json(raw_baseline_summary, raw_baseline_summary_path)
@@ -438,6 +543,7 @@ def main() -> None:
             build_retrieval_long,
             plot_class_retrieval,
             plot_mrr,
+            plot_topk_hit,
             plot_topk_recall,
             summarize_retrieval,
         )
@@ -450,6 +556,7 @@ def main() -> None:
         retrieval_summary = summarize_retrieval(retrieval_long)
         retrieval_summary.to_csv(retrieval_plot_dir / "retrieval_summary.csv", index=False)
         retrieval_plots = {
+            "topk_hit": plot_topk_hit(retrieval_summary, retrieval_plot_dir, "retrieval", top_k_values),
             "topk_recall": plot_topk_recall(retrieval_summary, retrieval_plot_dir, "retrieval", top_k_values),
             "mrr": plot_mrr(retrieval_summary, retrieval_plot_dir, "retrieval"),
             "class_retrieval": plot_class_retrieval(summary, retrieval_plot_dir, "retrieval"),

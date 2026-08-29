@@ -4,7 +4,7 @@ data:
   splits_path: data/MIBIG/splits/random_seed42.tsv
 
 featurization:
-  bgc_encoder: esm2_cls
+  bgc_encoder: ohe
   molecule_encoder: morgan
   one_hot_alphabet: ACDEFGHIKLMNPQRSTVWYX
   bgc_batch_size: 1
@@ -43,4 +43,4 @@ downstream:
   dropout: 0.1
 
 output:
-  dir: results/esm2_cls
+  dir: results/ohe

@@ -51,12 +51,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--task",
         action="append",
-        choices=["bgc_class", "compound_mw", "origin_type"],
+        choices=[
+            "bgc_class",
+            "bioactivity_class",
+            "npclassifier_pathway",
+            "npclassifier_superclass",
+            "npclassifier_class",
+            "compound_mw",
+            "compound_logp",
+            "compound_tpsa",
+            "origin_type",
+        ],
         default=None,
         help="Repeat to run a subset of downstream tasks. By default all downstream tasks are run.",
     )
     parser.add_argument("--npatlas_path", type=str, default="data/NPAtlas_download_2024_09.tsv")
     parser.add_argument("--mibig_pairs_path", type=str, default="data/MIBIG/processed/mibig_pairs.tsv")
+    parser.add_argument("--bioactivity_table_path", type=str, default="results/EDA/bgc_observed_bioactivities.csv")
+    parser.add_argument(
+        "--npclassifier_pair_labels_path",
+        type=str,
+        default="data/MIBIG/processed/mibig_pairs_npclassifier_labels.tsv",
+    )
     parser.add_argument("--mw_bins", type=int, default=50)
     parser.add_argument("--force_rebuild_match", action="store_true")
     return parser.parse_args()
@@ -103,13 +119,14 @@ def _log_regression_summary(logger, task_name: str, metrics: dict) -> None:
             continue
         report = metrics[split]
         logger.info(
-            "%s %s: loss=%.6f mse=%.6f rmse=%.6f r2=%.6f spearman=%.6f",
+            "%s %s: loss=%.6f mse=%.6f rmse=%.6f r2=%.6f pearson=%.6f spearman=%.6f",
             task_name,
             split,
             report["loss"],
             report["mse"],
             report["rmse"],
             report["r2"],
+            report.get("pearson", 0.0),
             report["spearman"],
         )
     logger.info("%s test baselines: %s", task_name, metrics["test"].get("random_baselines", {}))
@@ -144,6 +161,8 @@ def main() -> None:
         tasks=args.task,
         npatlas_path=args.npatlas_path,
         mibig_pairs_path=args.mibig_pairs_path,
+        bioactivity_table_path=args.bioactivity_table_path,
+        npclassifier_pair_labels_path=args.npclassifier_pair_labels_path,
         mw_bins=int(args.mw_bins),
         force_rebuild_match=bool(args.force_rebuild_match),
     )
@@ -152,9 +171,16 @@ def main() -> None:
         logger.info("Matched compounds saved to %s", metrics["matched_compounds_path"])
     for task_name in metrics["tasks"]:
         task_metrics = metrics[task_name]
-        if task_name in {"bgc_class", "origin_type"}:
+        if task_name in {
+            "bgc_class",
+            "bioactivity_class",
+            "npclassifier_pathway",
+            "npclassifier_superclass",
+            "npclassifier_class",
+            "origin_type",
+        }:
             _log_classification_summary(logger, task_name, task_metrics)
-        elif task_name == "compound_mw":
+        elif task_name in {"compound_mw", "compound_logp", "compound_tpsa"}:
             _log_regression_summary(logger, task_name, task_metrics)
 
 

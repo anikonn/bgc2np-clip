@@ -15,6 +15,14 @@ from clip_core.logging import save_json
 
 RETRIEVAL_METRICS = (
     "mrr",
+    "hit_at_1",
+    "hit_at_5",
+    "hit_at_10",
+    "hit_at_20",
+    "hit_at_50",
+    "hit_at_100",
+    "hit_at_200",
+    "hit_at_500",
     "recall_at_1",
     "recall_at_5",
     "recall_at_10",

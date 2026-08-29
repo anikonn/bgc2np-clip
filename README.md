@@ -69,6 +69,9 @@ pip install -U pip
 pip install -e .
 ```
 
+Run project commands from the repository root. If your shell cannot resolve the
+`projects.*` modules, prefix commands with `PYTHONPATH=.`.
+
 Optional dependency for parquet UMAP exports:
 
 ```bash

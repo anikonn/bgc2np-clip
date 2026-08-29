@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -42,6 +43,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional MIBiG protein FASTA used to supplement BGCs missing from processed bgc_proteins.jsonl.",
     )
+    parser.add_argument(
+        "--bgc_sequences_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSONL that replaces bgc_proteins.jsonl as the BGC sequence source. "
+            "It must contain bgc_id and protein_seqs fields; antiSMASH domain records use "
+            "the same schema so the existing BGC encoders can process them."
+        ),
+    )
     parser.add_argument("--override", nargs="*", default=[])
     return parser.parse_args()
 
@@ -77,6 +88,25 @@ def _load_bgcmac_bgc_ids(path: str | Path | None) -> set[str]:
     return set(split_df["BGC_number"].dropna().astype(str).tolist())
 
 
+def _load_bgc_sequences(path: str | Path) -> dict[str, dict[str, object]]:
+    records: dict[str, dict[str, object]] = {}
+    source_path = Path(path)
+    with source_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if "bgc_id" not in record or "protein_seqs" not in record:
+                raise ValueError(
+                    f"{source_path}:{line_number} must contain bgc_id and protein_seqs"
+                )
+            bgc_id = str(record["bgc_id"])
+            if bgc_id in records:
+                raise ValueError(f"Duplicate bgc_id in {source_path}: {bgc_id}")
+            records[bgc_id] = record
+    return records
+
+
 def main() -> None:
     args = parse_args()
     logger = setup_logger("mibig_bgc_np")
@@ -85,7 +115,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     pair_df = load_pair_table(args.data_dir)
-    proteins_index = load_bgc_proteins(args.data_dir)
+    proteins_index = (
+        _load_bgc_sequences(args.bgc_sequences_path)
+        if args.bgc_sequences_path is not None
+        else load_bgc_proteins(args.data_dir)
+    )
     map_bgc_ids, map_compound_rows = _load_map_cache_rows(args.map_metadata_path)
     bgcmac_bgc_ids = _load_bgcmac_bgc_ids(args.bgcmac_splits_path)
     supplemented_bgc_count = 0
@@ -93,7 +127,7 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     bgc_encoder = build_bgc_encoder(cfg["featurization"], device=device)
-    molecule_encoder = build_molecule_encoder(cfg["featurization"])
+    molecule_encoder = build_molecule_encoder(cfg["featurization"], device=device)
     bgc_batch_size = int(cfg["featurization"].get("bgc_batch_size", 1))
 
     bgc_ids = sorted(set(pair_df["bgc_id"].astype(str).tolist()) | map_bgc_ids | bgcmac_bgc_ids)
@@ -137,12 +171,25 @@ def main() -> None:
             .reset_index(drop=True)
         )
     compound_cache = FeatureCache(outdir / "compound_features.pt")
-    for row in tqdm(compound_df.itertuples(index=False), total=len(compound_df), desc="Compound features"):
+    compound_batch_size = int(cfg["featurization"].get("compound_batch_size", 64))
+    for start in tqdm(
+        range(0, len(compound_df), compound_batch_size),
+        desc="Compound features",
+    ):
+        batch_df = compound_df.iloc[start : start + compound_batch_size]
+        compound_ids = batch_df["compound_id"].astype(str).tolist()
+        smiles = batch_df["smiles"].astype(str).tolist()
         try:
-            feature = molecule_encoder.encode([str(row.smiles)])[0]
-            compound_cache.add(str(row.compound_id), feature)
+            batch_features = molecule_encoder.encode(smiles)
         except ValueError:
-            logger.warning("Skipping invalid SMILES for compound_id=%s", row.compound_id)
+            for compound_id, molecule in zip(compound_ids, smiles, strict=True):
+                try:
+                    compound_cache.add(compound_id, molecule_encoder.encode([molecule])[0])
+                except ValueError:
+                    logger.warning("Skipping invalid SMILES for compound_id=%s", compound_id)
+        else:
+            for compound_id, feature in zip(compound_ids, batch_features, strict=True):
+                compound_cache.add(compound_id, feature)
     compound_cache.save()
 
     cache_index = {
@@ -155,6 +202,9 @@ def main() -> None:
         "map_metadata_path": str(args.map_metadata_path) if args.map_metadata_path is not None else None,
         "bgcmac_splits_path": str(args.bgcmac_splits_path) if args.bgcmac_splits_path is not None else None,
         "fasta_path": str(args.fasta_path) if args.fasta_path is not None else None,
+        "bgc_sequences_path": (
+            str(args.bgc_sequences_path) if args.bgc_sequences_path is not None else None
+        ),
         "n_bgc_records_supplemented_from_fasta": int(supplemented_bgc_count),
         "bgc_dim": int(next(iter(bgc_cache.data.values())).numel()),
         "compound_dim": int(next(iter(compound_cache.data.values())).numel()),

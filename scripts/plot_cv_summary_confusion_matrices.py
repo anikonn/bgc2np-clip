@@ -301,11 +301,20 @@ def plot_summary(summary_path: Path, output_dir: Path, suffix: str = "cv10_mean"
         _plot_confusion_matrix(matrix, path, title=title, reorder_bgc_classes=True)
         outputs.append(path)
 
-    roc_title = "ROC Curve for BGC-MAC" if "bgcmac" in suffix.lower() else f"ROC Curve for BGC Class Prediction ({suffix}, test)"
+    if "bgcmac" in suffix.lower():
+        roc_title = "ROC Curve for BGC-MAC"
+    elif "strict" in str(summary_path).lower():
+        roc_title = "ROC Curve for BGC Class Prediction (CV10, strict split)"
+    else:
+        roc_title = f"ROC Curve for BGC Class Prediction ({suffix}, test)"
     roc_path = output_dir / f"downstream_roc_curve_test_{suffix}.png"
     _plot_bgc_class_roc(summary, bgc_test, roc_path, title=roc_title)
     if roc_path.exists():
         outputs.append(roc_path)
+    roc_pdf_path = roc_path.with_suffix(".pdf")
+    _plot_bgc_class_roc(summary, bgc_test, roc_pdf_path, title=roc_title)
+    if roc_pdf_path.exists():
+        outputs.append(roc_pdf_path)
 
     grid_path = output_dir / f"downstream_confusion_matrices_test_classes_{suffix}.png"
     _plot_binary_confusion_grid(

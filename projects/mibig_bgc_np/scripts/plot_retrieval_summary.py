@@ -20,17 +20,17 @@ TOP_K_DEFAULT = (5, 10, 20, 50, 100, 200, 500)
 DIRECTIONS = ("bgc_to_compound", "compound_to_bgc")
 DIRECTION_LABELS = {"bgc_to_compound": "BGC to NP", "compound_to_bgc": "NP to BGC"}
 DIRECTION_SUFFIXES = {"bgc_to_compound": "bgc_to_np", "compound_to_bgc": "np_to_bgc"}
-METHOD_ORDER = ("random", "frozen_encoder_similarity", "knn5", "model")
+METHOD_ORDER = ("random", "frozen_encoder_similarity", "knn", "model")
 METHOD_LABELS = {
     "random": "Random",
     "frozen_encoder_similarity": "Frozen",
-    "knn5": "KNN-5",
+    "knn": "KNN",
     "model": "BGC2NP-CLIP",
 }
 COLORS = {
     "random": "#b85b61",
     "frozen_encoder_similarity": "#8c8c8c",
-    "knn5": "#64b27b",
+    "knn": "#64b27b",
     "model": "#4c72b0",
 }
 
@@ -69,9 +69,9 @@ def _baseline_blocks(baselines: dict[str, Any]) -> list[tuple[str, dict[str, Any
             blocks.append((name, payload["metrics"]))
     knn = baselines.get("knn_transfer")
     if isinstance(knn, dict):
-        metrics = knn.get("metrics_by_k", {}).get("5")
+        metrics = knn.get("metrics_by_k", {}).get("1")
         if isinstance(metrics, dict):
-            blocks.append(("knn5", metrics))
+            blocks.append(("knn", metrics))
     return blocks
 
 
@@ -99,6 +99,18 @@ def build_retrieval_long(summary: dict[str, Any], top_k_values: list[int]) -> pd
                         }
                     )
                 for top_k in top_k_values:
+                    hit = _as_float(metrics.get(f"hit_at_{int(top_k)}"))
+                    if hit is not None:
+                        rows.append(
+                            {
+                                "fold_id": fold_id,
+                                "method": method,
+                                "direction": direction,
+                                "metric": "hit",
+                                "top_k": int(top_k),
+                                "value": float(hit),
+                            }
+                        )
                     recall = _as_float(metrics.get(f"recall_at_{int(top_k)}"))
                     if recall is None:
                         continue
@@ -168,6 +180,50 @@ def plot_topk_recall(summary_df: pd.DataFrame, outdir: Path, prefix: str, top_k_
         fig.legend(handles, labels, loc="center right", frameon=True)
         fig.subplots_adjust(right=0.78)
         path = outdir / f"{prefix}_{DIRECTION_SUFFIXES[direction]}_topk_recall.png"
+        fig.savefig(path, dpi=220)
+        plt.close(fig)
+        paths.append(str(path))
+    return paths
+
+
+def plot_topk_hit(summary_df: pd.DataFrame, outdir: Path, prefix: str, top_k_values: list[int]) -> list[str]:
+    paths: list[str] = []
+    hit_df = summary_df[summary_df["metric"] == "hit"].copy()
+    methods = _available_methods(hit_df)
+    for direction in DIRECTIONS:
+        direction_df = hit_df[hit_df["direction"] == direction]
+        if direction_df.empty:
+            continue
+        x = np.arange(len(top_k_values), dtype=float)
+        width = min(0.12, 0.78 / max(len(methods), 1))
+        offsets = (np.arange(len(methods), dtype=float) - (len(methods) - 1) / 2.0) * width
+        fig, ax = plt.subplots(figsize=(8.8, 4.4))
+        for offset, method in zip(offsets, methods, strict=True):
+            values = []
+            for top_k in top_k_values:
+                row = direction_df[(direction_df["method"] == method) & (direction_df["top_k"] == int(top_k))]
+                values.append(float(row.iloc[0]["value_mean"]) if not row.empty else np.nan)
+            ax.bar(
+                x + offset,
+                values,
+                width=width,
+                label=METHOD_LABELS.get(method, method),
+                color=COLORS.get(method, "#999999"),
+                edgecolor="white",
+                linewidth=0.5,
+            )
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(k) for k in top_k_values])
+        ax.set_xlabel("top-K")
+        ax.set_ylabel("Hit@K")
+        ax.set_title(DIRECTION_LABELS.get(direction, direction))
+        ax.grid(axis="y", color="#d9d9d9", linewidth=0.8)
+        ax.set_axisbelow(True)
+        ax.set_ylim(bottom=0.0)
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="center right", frameon=True)
+        fig.subplots_adjust(right=0.78)
+        path = outdir / f"{prefix}_{DIRECTION_SUFFIXES[direction]}_topk_hit.png"
         fig.savefig(path, dpi=220)
         plt.close(fig)
         paths.append(str(path))
@@ -377,6 +433,7 @@ def main() -> None:
     summary_df.to_csv(summary_path, index=False)
 
     plots = {
+        "topk_hit": plot_topk_hit(summary_df, outdir, args.prefix, top_k_values),
         "topk_recall": plot_topk_recall(summary_df, outdir, args.prefix, top_k_values),
         "mrr": plot_mrr(summary_df, outdir, args.prefix),
         "class_retrieval": plot_class_retrieval(summary, outdir, args.prefix),

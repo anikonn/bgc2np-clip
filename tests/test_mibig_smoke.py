@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 
 from clip_core.losses import multi_positive_infonce_loss, symmetric_infonce_loss
+from clip_core.retrieval import _metrics_from_sorted_positive_mask
 from mibig_clip.data.splits import (
     assign_cv_folds_by_bgc,
     assign_cv_folds_by_np,
@@ -16,11 +17,19 @@ from mibig_clip.data.splits import (
 from projects.mibig_bgc_np.data.datasets import CachedInteractionDataset, build_interactions
 from projects.mibig_bgc_np.models.clip_dual import DualEncoderCLIP
 from projects.mibig_bgc_np.scripts.run_bgcmac_ensemble import _build_bgcmac_interactions, _load_bgcmac_fold_table
+from projects.mibig_bgc_np.eval.retrieval_class_metrics import _precision_recall_f1
+from projects.mibig_bgc_np.eval.regression_metrics import pearson
+from projects.mibig_bgc_np.scripts.plot_molecular_property_prediction import build_molecular_property_metric_table
 from projects.mibig_bgc_np.training.contrastive_trainer import _build_batch_positive_mask
 from projects.mibig_bgc_np.training.downstream_trainer import (
+    BIOACTIVITY_CLASS_NAMES,
+    NPCLASSIFIER_TASKS,
     _binary_roc_curve,
     _build_bgc_multilabel_features,
     _frame_to_tensor_dataset,
+    _load_bioactivity_class_table,
+    _load_npclassifier_bgc_label_table,
+    _safe_molecular_properties,
 )
 
 
@@ -234,6 +243,49 @@ def test_build_interactions_supports_pair_level_split_files(tmp_path: Path) -> N
     }
 
 
+def test_build_interactions_maps_fold_id_files_to_test_val_train(tmp_path: Path) -> None:
+    data_dir = tmp_path / "processed"
+    data_dir.mkdir(parents=True)
+    _write_tsv(
+        data_dir / "mibig_pairs.tsv",
+        "bgc_id\tcompound_id\tsmiles\tbgc_class",
+        [
+            "B1\tC1\tCCO\tNRPS",
+            "B2\tC2\tCCN\tPKS",
+            "B3\tC3\tCCC\tRiPP",
+            "B4\tC4\tCCCl\tTerpene",
+        ],
+    )
+    _write_jsonl(
+        data_dir / "bgc_proteins.jsonl",
+        [
+            {"bgc_id": "B1", "protein_ids": ["P1"], "protein_seqs": ["MKT"]},
+            {"bgc_id": "B2", "protein_ids": ["P2"], "protein_seqs": ["MSS"]},
+            {"bgc_id": "B3", "protein_ids": ["P3"], "protein_seqs": ["MAA"]},
+            {"bgc_id": "B4", "protein_ids": ["P4"], "protein_seqs": ["MNN"]},
+        ],
+    )
+    split_path = tmp_path / "cv.tsv"
+    _write_tsv(
+        split_path,
+        "bgc_id\tfold_id",
+        [
+            "B1\t1",
+            "B2\t2",
+            "B3\t3",
+            "B4\t4",
+        ],
+    )
+
+    interactions = build_interactions(data_dir, splits_path=split_path, cv_fold=2, val_fold=3)
+
+    split_by_bgc = {
+        row.bgc_id: row.split
+        for row in interactions[["bgc_id", "split"]].drop_duplicates().itertuples(index=False)
+    }
+    assert split_by_bgc == {"B1": "train", "B2": "test", "B3": "val", "B4": "train"}
+
+
 def test_bgcmac_fold_table_assigns_fixed_test_and_rotating_val(tmp_path: Path) -> None:
     data_dir = tmp_path / "processed"
     data_dir.mkdir(parents=True)
@@ -258,10 +310,10 @@ def test_bgcmac_fold_table_assigns_fixed_test_and_rotating_val(tmp_path: Path) -
     split_path.write_text(
         "\n".join(
             [
-                "BGC_number,fold,is_test",
-                "B1,1,False",
-                "B2,2,False",
-                "B3,10,True",
+                "BGC_number,biosyn_class,fold,is_test",
+                "B1,NRPS,1,False",
+                "B2,PKS,2,False",
+                "B3,RiPP,10,True",
             ]
         )
         + "\n",
@@ -321,3 +373,200 @@ def test_frame_to_tensor_dataset_allows_empty_split() -> None:
 
     assert x.shape == (0, 64)
     assert y.shape == (0,)
+
+
+def test_bioactivity_class_table_keeps_only_selected_observed_labels(tmp_path: Path) -> None:
+    data_dir = tmp_path / "processed"
+    data_dir.mkdir(parents=True)
+    _write_tsv(
+        data_dir / "mibig_pairs.tsv",
+        "bgc_id\tcompound_id\tsmiles\tbgc_class",
+        [
+            "B1\tC1\tCCO\tNRPS",
+            "B2\tC2\tCCN\tPKS",
+            "B3\tC3\tCCC\tRiPP",
+        ],
+    )
+    _write_jsonl(
+        data_dir / "bgc_proteins.jsonl",
+        [
+            {"bgc_id": "B1", "protein_ids": ["P1"], "protein_seqs": ["MKT"]},
+            {"bgc_id": "B2", "protein_ids": ["P2"], "protein_seqs": ["MSS"]},
+            {"bgc_id": "B3", "protein_ids": ["P3"], "protein_seqs": ["MAA"]},
+        ],
+    )
+    split_path = tmp_path / "cv.tsv"
+    _write_tsv(
+        split_path,
+        "bgc_id\tfold_id",
+        [
+            "B1\t1",
+            "B2\t2",
+            "B3\t3",
+        ],
+    )
+    bioactivity_path = tmp_path / "bioactivity.csv"
+    bioactivity_path.write_text(
+        "\n".join(
+            [
+                "bgc_id,n_observed_bioactivities,observed_bioactivities",
+                "B1,2,antibacterial;cytotoxic",
+                "B2,1,other",
+                "B3,1,antiviral",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    table = _load_bioactivity_class_table(
+        data_dir=data_dir,
+        bioactivity_table_path=bioactivity_path,
+        splits_path=split_path,
+        cv_fold=2,
+        val_fold=3,
+    )
+
+    assert set(table["bgc_id"]) == {"B1", "B3"}
+    labels_by_bgc = {row.bgc_id: row.bgc_class_list for row in table.itertuples(index=False)}
+    assert labels_by_bgc["B1"] == ["antibacterial", "cytotoxic"]
+    assert labels_by_bgc["B3"] == ["antiviral"]
+    assert set(labels_by_bgc["B1"]).issubset(set(BIOACTIVITY_CLASS_NAMES))
+
+
+def test_npclassifier_superclass_table_filters_labels_and_respects_pair_folds(tmp_path: Path) -> None:
+    data_dir = tmp_path / "processed"
+    data_dir.mkdir(parents=True)
+    _write_tsv(
+        data_dir / "mibig_pairs.tsv",
+        "bgc_id\tcompound_id\tsmiles\tbgc_class",
+        [
+            "B1\tC1\tCCO\tNRPS",
+            "B1\tC2\tCCN\tNRPS",
+            "B2\tC3\tCCC\tPKS",
+        ],
+    )
+    _write_jsonl(
+        data_dir / "bgc_proteins.jsonl",
+        [
+            {"bgc_id": "B1", "protein_ids": ["P1"], "protein_seqs": ["MKT"]},
+            {"bgc_id": "B2", "protein_ids": ["P2"], "protein_seqs": ["MSS"]},
+        ],
+    )
+    split_path = tmp_path / "np_cv.tsv"
+    _write_tsv(
+        split_path,
+        "bgc_id\tcompound_id\tfold_id",
+        [
+            "B1\tC1\t1",
+            "B1\tC2\t2",
+            "B2\tC3\t3",
+        ],
+    )
+    labels_path = tmp_path / "mibig_pairs_npclassifier_labels.tsv"
+    _write_tsv(
+        labels_path,
+        "bgc_id\tcompound_id\tcanonical_smiles\tnpclassifier_pathway\tnpclassifier_superclass\tnpclassifier_class",
+        [
+            "B1\tC1\tCCO\tAmino acids and Peptides\tOligopeptides\tCyclic peptides",
+            "B1\tC2\tCCN\tPolyketides\tMacrolides\tDepsipeptides",
+            "B2\tC3\tCCC\tAmino acids and Peptides\tOligopeptides\tLinear peptides",
+        ],
+    )
+    counts_path = tmp_path / "npclassifier_superclass_counts.csv"
+    counts_path.write_text(
+        "label,n_compounds\nOligopeptides,101\nMacrolides,100\n",
+        encoding="utf-8",
+    )
+
+    original_counts_path = NPCLASSIFIER_TASKS["npclassifier_superclass"]["counts_path"]
+    NPCLASSIFIER_TASKS["npclassifier_superclass"]["counts_path"] = str(counts_path)
+    try:
+        table, labels, stats = _load_npclassifier_bgc_label_table(
+            data_dir=data_dir,
+            npclassifier_pair_labels_path=labels_path,
+            task_name="npclassifier_superclass",
+            splits_path=split_path,
+            cv_fold=2,
+            val_fold=3,
+        )
+    finally:
+        NPCLASSIFIER_TASKS["npclassifier_superclass"]["counts_path"] = original_counts_path
+
+    assert labels == ["Oligopeptides"]
+    assert stats["min_count_exclusive"] == 100
+    assert set(table["split"]) == {"train", "val"}
+    labels_by_bgc_split = {(row.bgc_id, row.split): row.bgc_class_list for row in table.itertuples(index=False)}
+    assert labels_by_bgc_split[("B1", "train")] == ["Oligopeptides"]
+    assert ("B1", "test") not in labels_by_bgc_split
+    assert labels_by_bgc_split[("B2", "val")] == ["Oligopeptides"]
+
+
+def test_rdkit_molecular_properties_include_logp_and_tpsa() -> None:
+    from rdkit import Chem
+
+    props = _safe_molecular_properties("CCO", Chem)
+
+    assert props["compound_rdkit_mw"] is not None
+    assert props["compound_logp"] is not None
+    assert props["compound_tpsa"] is not None
+    assert props["compound_tpsa"] > 0.0
+
+
+def test_pearson_handles_constant_vectors() -> None:
+    assert pearson(torch.ones(3).numpy(), torch.arange(3).numpy()) == 0.0
+    assert abs(pearson(torch.arange(3).numpy(), torch.arange(3).numpy()) - 1.0) < 1e-12
+
+
+def test_molecular_property_metric_table_reads_cv_summary(tmp_path: Path) -> None:
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "aggregate": {
+                    "downstream": {
+                        "compound_mw": {"test": {"pearson": {"mean": 0.1, "std": 0.01, "n": 10}}},
+                        "compound_logp": {"test": {"pearson": {"mean": 0.2, "std": 0.02, "n": 10}}},
+                        "compound_tpsa": {"test": {"spearman": {"mean": 0.3, "std": 0.03, "n": 10}}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    table = build_molecular_property_metric_table({"bgc": summary_path})
+
+    row = table[(table["split"] == "bgc") & (table["property"] == "TPSA") & (table["metric"] == "spearman")]
+    assert float(row.iloc[0]["mean"]) == 0.3
+
+
+def test_binary_confusion_metrics_include_accuracy() -> None:
+    metrics = _precision_recall_f1(
+        {
+            "raw": {
+                "Negative": {"Negative": 8, "Positive": 2},
+                "Positive": {"Negative": 1, "Positive": 9},
+            }
+        }
+    )
+
+    assert metrics["accuracy"] == 0.85
+    assert metrics["precision"] == 9 / 11
+    assert metrics["recall"] == 0.9
+
+
+def test_retrieval_hit_and_recall_use_different_denominators() -> None:
+    sorted_pos = torch.tensor(
+        [
+            [True, True, False],
+            [False, False, True],
+        ]
+    )
+
+    metrics = _metrics_from_sorted_positive_mask(sorted_pos)
+
+    assert metrics.hit_at_1 == 0.5
+    assert metrics.recall_at_1 == 1 / 3
+    assert metrics.hit_at_5 == 1.0
+    assert metrics.recall_at_5 == 1.0

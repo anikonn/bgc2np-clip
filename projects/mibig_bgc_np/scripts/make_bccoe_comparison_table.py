@@ -16,14 +16,14 @@ TOP_K = (10, 100)
 METHOD_ORDER = (
     "random",
     "frozen_encoder_similarity",
-    "knn5",
+    "knn",
     "bccoe_paper",
     "model",
 )
 METHOD_LABELS = {
     "random": "Random",
     "frozen_encoder_similarity": "Frozen",
-    "knn5": "KNN-5",
+    "knn": "KNN",
     "bccoe_paper": "BCCoE (paper)",
     "model": "BGC2NP-CLIP",
 }
@@ -89,9 +89,9 @@ def _metric_block(fold: dict[str, Any], method: str, direction: str) -> dict[str
         payload = baselines.get(method)
         metrics = payload.get("metrics", {}).get(direction) if isinstance(payload, dict) else None
         return metrics if isinstance(metrics, dict) else None
-    if method == "knn5":
+    if method == "knn":
         payload = baselines.get("knn_transfer")
-        metrics = payload.get("metrics_by_k", {}).get("5", {}).get(direction) if isinstance(payload, dict) else None
+        metrics = payload.get("metrics_by_k", {}).get("1", {}).get(direction) if isinstance(payload, dict) else None
         return metrics if isinstance(metrics, dict) else None
     return None
 
@@ -107,13 +107,27 @@ def _as_float(value: Any) -> float | None:
     return None
 
 
-def _mean_recall(summary: dict[str, Any], method: str, direction: str, top_k: int) -> float:
+def _bccoe_recall_from_metrics(fold: dict[str, Any], metrics: dict[str, Any], direction: str, top_k: int) -> float | None:
+    precision = _as_float(metrics.get(f"precision_at_{top_k}"))
+    test_counts = fold.get("counts", {}).get("test", {})
+    if precision is None or not isinstance(test_counts, dict):
+        return None
+    n_queries_key = "n_bgcs" if direction == "bgc_to_compound" else "n_compounds"
+    n_queries = _as_float(test_counts.get(n_queries_key))
+    n_ground_truth = _as_float(test_counts.get("n_pairs"))
+    if n_queries is None or n_ground_truth is None or n_ground_truth <= 0:
+        return None
+    hits = precision * float(top_k) * n_queries
+    return max(0.0, min(1.0, hits / n_ground_truth))
+
+
+def _mean_bccoe_recall(summary: dict[str, Any], method: str, direction: str, top_k: int) -> float:
     recalls: list[float] = []
     for fold in summary.get("folds", []):
         metrics = _metric_block(fold, method, direction)
         if not metrics:
             continue
-        recall = _as_float(metrics.get(f"recall_at_{top_k}"))
+        recall = _bccoe_recall_from_metrics(fold, metrics, direction, top_k)
         if recall is None:
             continue
         recalls.append(recall)
@@ -137,13 +151,13 @@ def _make_long_rows(experiments: tuple[Experiment, ...]) -> list[dict[str, str]]
                 if method == "bccoe_paper":
                     _paper_count, recall = PAPER_BCCOE[(exp.key, top_k)]
                 else:
-                    recall = _mean_recall(summaries[exp.key], method, exp.direction, top_k)
+                    recall = _mean_bccoe_recall(summaries[exp.key], method, exp.direction, top_k)
                 rows.append(
                     {
                         "method": METHOD_LABELS[method],
                         "experiment": exp.label,
                         "top_k": str(top_k),
-                        "recall": _format_recall(recall),
+                        "bccoe_recall": _format_recall(recall),
                     }
                 )
     return rows
@@ -161,7 +175,7 @@ def _make_wide_rows(long_rows: list[dict[str, str]], experiments: tuple[Experime
             for top_k in TOP_K:
                 source = by_key[(method, exp.label, str(top_k))]
                 prefix = f"{exp.label} top-{top_k}"
-                row[f"{prefix} Recall"] = source["recall"]
+                row[f"{prefix} BCCoE Recall"] = source["bccoe_recall"]
         rows.append(row)
     return rows
 
@@ -177,7 +191,7 @@ def _make_compact_rows(long_rows: list[dict[str, str]], experiments: tuple[Exper
         for exp in experiments:
             for top_k in TOP_K:
                 source = by_key[(method, exp.label, str(top_k))]
-                row[f"{exp.label} top-{top_k}"] = source["recall"]
+                row[f"{exp.label} top-{top_k}"] = source["bccoe_recall"]
         rows.append(row)
     return rows
 

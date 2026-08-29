@@ -1,0 +1,44 @@
+seed: 42
+
+data:
+  splits_path: data/MIBIG/splits/strict_bigscape_butina_cv_seed42_n10.tsv
+
+featurization:
+  bgc_encoder: provided_bgcmac_antismash_domain_esm2_mean
+  molecule_encoder: morgan
+  bgc_batch_size: 1
+  protein_batch_size: 8
+  protein_max_length: 1024
+  morgan_radius: 2
+  morgan_bits: 2048
+
+model:
+  name: dual_encoder_clip
+  emb_dim: 256
+  hidden_dim: 512
+  dropout: 0.1
+  init_temperature: 0.07
+  max_logit_scale: 100.0
+
+train:
+  epochs: 20
+  batch_size: 256
+  lr: 0.0003
+  weight_decay: 0.0001
+  num_workers: 0
+
+eval:
+  sim_batch_size: 1024
+  selection_split: val
+
+downstream:
+  feature_batch_size: 1024
+  epochs: 30
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  hidden_dim: 256
+  dropout: 0.1
+
+output:
+  dir: results/antismash_domain_esm2

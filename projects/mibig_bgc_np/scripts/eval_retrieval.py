@@ -56,6 +56,9 @@ def _load_model(ckpt_path: str | Path, device: torch.device) -> tuple[DualEncode
         dropout=cfg["model"]["dropout"],
         init_temperature=cfg["model"]["init_temperature"],
         max_logit_scale=cfg["model"]["max_logit_scale"],
+        bgc_aggregation=str(cfg["model"].get("bgc_aggregation", "prepooled")),
+        bgc_aggregation_config=cfg["model"].get("bgc_aggregation_config", {}),
+        projection_head=str(cfg["model"].get("projection_head", "mlp_gelu")),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -259,12 +262,14 @@ def _evaluate_npatlas_retrieval(
     matched_by_query, match_counts = _match_true_products(query_df, npatlas_df)
     test_bgc_ids = sorted(interactions[interactions["split"].str.lower() == split.lower()]["bgc_id"].astype(str).unique().tolist())
     rng = np.random.default_rng(int(seed))
-    molecule_encoder = build_molecule_encoder(cfg["featurization"])
+    molecule_encoder = build_molecule_encoder(cfg["featurization"], device=device)
 
     reciprocal_ranks: list[float] = []
     best_ranks: list[int] = []
-    recall_at = {1: [], 5: [], 10: []}
+    hit_at = {1: [], 5: [], 10: []}
+    recall_hits = {1: 0, 5: 0, 10: 0}
     precision_at = {1: [], 5: [], 10: []}
+    total_ground_truth = 0
     skipped_no_match = 0
     skipped_not_in_sample = 0
     eligible_bgcs = 0
@@ -322,20 +327,25 @@ def _evaluate_npatlas_retrieval(
         best_rank = int(true_ranks[0])
 
         eligible_bgcs += 1
+        total_ground_truth += len(true_set)
         best_ranks.append(best_rank)
         reciprocal_ranks.append(1.0 / float(best_rank))
         ranked_true = [1 if candidate_id in true_set else 0 for candidate_id in ranked_ids]
         for k in (1, 5, 10):
             topk = ranked_true[:k]
-            recall_at[k].append(float(any(topk)))
+            hit_at[k].append(float(any(topk)))
+            recall_hits[k] += int(sum(topk))
             precision_at[k].append(float(sum(topk) / float(k)))
 
     metrics = {
         "mrr": float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0,
         "median_rank": float(np.median(best_ranks)) if best_ranks else 0.0,
-        "recall_at_1": float(np.mean(recall_at[1])) if recall_at[1] else 0.0,
-        "recall_at_5": float(np.mean(recall_at[5])) if recall_at[5] else 0.0,
-        "recall_at_10": float(np.mean(recall_at[10])) if recall_at[10] else 0.0,
+        "hit_at_1": float(np.mean(hit_at[1])) if hit_at[1] else 0.0,
+        "hit_at_5": float(np.mean(hit_at[5])) if hit_at[5] else 0.0,
+        "hit_at_10": float(np.mean(hit_at[10])) if hit_at[10] else 0.0,
+        "recall_at_1": float(recall_hits[1] / total_ground_truth) if total_ground_truth else 0.0,
+        "recall_at_5": float(recall_hits[5] / total_ground_truth) if total_ground_truth else 0.0,
+        "recall_at_10": float(recall_hits[10] / total_ground_truth) if total_ground_truth else 0.0,
         "precision_at_1": float(np.mean(precision_at[1])) if precision_at[1] else 0.0,
         "precision_at_5": float(np.mean(precision_at[5])) if precision_at[5] else 0.0,
         "precision_at_10": float(np.mean(precision_at[10])) if precision_at[10] else 0.0,

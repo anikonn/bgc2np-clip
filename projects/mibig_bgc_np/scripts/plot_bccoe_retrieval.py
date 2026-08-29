@@ -18,11 +18,11 @@ import matplotlib.pyplot as plt
 
 DEFAULT_TOP_K = (5, 10, 20, 50, 100, 200, 500)
 DEFAULT_DIRECTIONS = ("bgc_to_compound", "compound_to_bgc")
-METHOD_ORDER = ("random", "frozen_encoder_similarity", "knn5", "model")
+METHOD_ORDER = ("random", "frozen_encoder_similarity", "knn", "model")
 METHOD_LABELS = {
     "random": "Random",
     "frozen_encoder_similarity": "Frozen",
-    "knn5": "KNN-5",
+    "knn": "KNN",
     "model": "Combi",
 }
 DIRECTION_LABELS = {
@@ -36,11 +36,11 @@ DIRECTION_SUFFIXES = {
 COLORS = {
     "random": "#b85b61",
     "frozen_encoder_similarity": "#8c8c8c",
-    "knn5": "#64b27b",
+    "knn": "#64b27b",
     "model": "#4c72b0",
 }
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot BCCoE-style top-K recall panels from a run summary.")
+    parser = argparse.ArgumentParser(description="Plot BCCoE paper-style top-K recall panels from a run summary.")
     parser.add_argument("--summary", type=Path, required=True, help="Path to a run_cv10 summary.json file.")
     parser.add_argument("--outdir", type=Path, default=None, help="Output directory. Defaults beside the summary.")
     parser.add_argument("--prefix", type=str, default="bccoe_retrieval", help="Output filename prefix.")
@@ -81,9 +81,34 @@ def _candidate_count(fold: dict[str, Any], direction: str) -> int | None:
     return None
 
 
+def _test_count(fold: dict[str, Any], key: str) -> float | None:
+    test_counts = fold.get("counts", {}).get("test", {})
+    if not isinstance(test_counts, dict):
+        return None
+    value = test_counts.get(key)
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    return None
+
+
+def _bccoe_recall_from_metrics(fold: dict[str, Any], metrics: dict[str, Any], direction: str, top_k: int) -> float | None:
+    precision = _as_float(metrics.get(f"precision_at_{int(top_k)}"))
+    if precision is None:
+        return None
+    n_queries_key = "n_bgcs" if direction == "bgc_to_compound" else "n_compounds"
+    n_queries = _test_count(fold, n_queries_key)
+    n_ground_truth = _test_count(fold, "n_pairs")
+    if n_queries is None or n_ground_truth is None or n_ground_truth <= 0:
+        return None
+    hits = precision * float(top_k) * n_queries
+    return max(0.0, min(1.0, hits / n_ground_truth))
+
+
 def _append_metrics(
     rows: list[dict[str, Any]],
     *,
+    fold: dict[str, Any],
     fold_id: int,
     method: str,
     direction: str,
@@ -92,7 +117,7 @@ def _append_metrics(
     top_k_values: list[int],
 ) -> None:
     for top_k in top_k_values:
-        recall = _as_float(metrics.get(f"recall_at_{int(top_k)}"))
+        recall = _bccoe_recall_from_metrics(fold, metrics, direction, int(top_k))
         if recall is None:
             continue
         rows.append(
@@ -115,9 +140,9 @@ def _baseline_metric_blocks(baselines: dict[str, Any]) -> list[tuple[str, dict[s
             blocks.append((name, payload["metrics"]))
     knn = baselines.get("knn_transfer")
     if isinstance(knn, dict):
-        metrics = knn.get("metrics_by_k", {}).get("5")
+        metrics = knn.get("metrics_by_k", {}).get("1")
         if isinstance(metrics, dict):
-            blocks.append(("knn5", metrics))
+            blocks.append(("knn", metrics))
     return blocks
 
 
@@ -131,6 +156,7 @@ def build_long_table(summary: dict[str, Any], top_k_values: list[int]) -> pd.Dat
             if isinstance(model_metrics, dict):
                 _append_metrics(
                     rows,
+                    fold=fold,
                     fold_id=fold_id,
                     method="model",
                     direction=direction,
@@ -145,6 +171,7 @@ def build_long_table(summary: dict[str, Any], top_k_values: list[int]) -> pd.Dat
                     if isinstance(direction_metrics, dict):
                         _append_metrics(
                             rows,
+                            fold=fold,
                             fold_id=fold_id,
                             method=method,
                             direction=direction,
@@ -208,7 +235,7 @@ def _plot_panel(
     ax.set_xticks(x)
     ax.set_xticklabels([str(k) for k in top_k_values])
     ax.set_xlabel("top-K")
-    ax.set_ylabel("Recall")
+    ax.set_ylabel("BCCoE Recall")
     ax.set_title(DIRECTION_LABELS.get(direction, direction))
     ax.grid(axis="y", color="#d9d9d9", linewidth=0.8)
     ax.set_axisbelow(True)

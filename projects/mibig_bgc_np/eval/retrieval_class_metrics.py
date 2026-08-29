@@ -146,11 +146,40 @@ def _precision_recall_f1(confusion: dict[str, Any]) -> dict[str, float]:
     fp = float(raw["Negative"]["Positive"])
     fn = float(raw["Positive"]["Negative"])
     tp = float(raw["Positive"]["Positive"])
-    del tn
+    total = tp + tn + fp + fn
+    accuracy = (tp + tn) / total if total else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-    return {"recall": float(recall), "precision": float(precision), "f1": float(f1)}
+    return {"accuracy": float(accuracy), "recall": float(recall), "precision": float(precision), "f1": float(f1)}
+
+
+def _ranking_metrics(
+    scores: torch.Tensor, positive_mask: torch.Tensor, k_values: tuple[int, ...] = (1, 5, 10)
+) -> dict[str, float | int]:
+    """Multi-positive ranking metrics for a selected set of class queries."""
+    valid = positive_mask.any(dim=1)
+    scores = scores[valid]
+    positive_mask = positive_mask[valid]
+    if scores.shape[0] == 0:
+        return {"n_queries": 0, "mrr": 0.0, **{f"recall_at_{k}": 0.0 for k in k_values}}
+    order = torch.argsort(scores, dim=1, descending=True)
+    ranked_positive = torch.gather(positive_mask, 1, order)
+    first = ranked_positive.to(torch.int64).argmax(dim=1) + 1
+    report: dict[str, float | int] = {
+        "n_queries": int(scores.shape[0]),
+        "n_candidates": int(scores.shape[1]),
+        "mrr": float((1.0 / first.float()).mean()),
+        "median_rank": float(first.float().median()),
+    }
+    n_positive = positive_mask.sum(dim=1).clamp_min(1)
+    for k in k_values:
+        effective_k = min(int(k), int(scores.shape[1]))
+        hits = ranked_positive[:, :effective_k].sum(dim=1)
+        report[f"recall_at_{k}"] = float((hits / n_positive).float().mean())
+        report[f"hit_at_{k}"] = float((hits > 0).float().mean())
+        report[f"precision_at_{k}"] = float((hits.float() / float(effective_k)).mean())
+    return report
 
 
 def evaluate_bgc_class_retrieval(
@@ -210,6 +239,18 @@ def evaluate_bgc_class_retrieval(
                 "thresholds": thresholds,
             },
             "confusion_matrix": _confusion(y_true, y_score, threshold),
+            "ranking": {
+                # BGC queries of this class rank against every test compound.
+                "bgc_to_compound": _ranking_metrics(sim_cpu[rows, :], pos_cpu[rows, :]),
+                # Compound queries with a positive BGC of this class rank against
+                # every test BGC; only class-matching positives count as relevant.
+                "compound_to_bgc": _ranking_metrics(
+                    sim_cpu.t(),
+                    torch.zeros_like(pos_cpu).index_copy(
+                        0, torch.as_tensor(rows, dtype=torch.long), pos_cpu[rows, :]
+                    ).t(),
+                ),
+            },
         }
         micro_true_parts.append(y_true)
         micro_score_parts.append(y_score)
@@ -292,6 +333,7 @@ def evaluate_bgc_class_pair_scores(
             "auroc": float(auc),
             "threshold": float(threshold),
             "threshold_source": "external" if thresholds_by_class is not None and class_name in thresholds_by_class else split,
+            "accuracy": prf["accuracy"],
             "recall": prf["recall"],
             "precision": prf["precision"],
             "f1": prf["f1"],
@@ -344,20 +386,20 @@ def save_bgc_map_metrics_table(report: dict[str, Any], output_dir: str | Path, p
                 {
                     "class": class_name,
                     "BGC count": int(metrics.get("n_bgcs", 0)),
-                    "model": "AUROC",
-                    "BGC-MAP": float(metrics.get("auroc", 0.0)),
+                    "model": "Accuracy",
+                    "BGC-MAP": float(metrics.get("accuracy", 0.0)),
                 },
                 {
                     "class": "",
                     "BGC count": "",
-                    "model": "recall",
-                    "BGC-MAP": float(metrics.get("recall", 0.0)),
-                },
-                {
-                    "class": "",
-                    "BGC count": "",
-                    "model": "precision",
+                    "model": "Precision",
                     "BGC-MAP": float(metrics.get("precision", 0.0)),
+                },
+                {
+                    "class": "",
+                    "BGC count": "",
+                    "model": "Recall",
+                    "BGC-MAP": float(metrics.get("recall", 0.0)),
                 },
                 {
                     "class": "",

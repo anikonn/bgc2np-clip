@@ -1,0 +1,48 @@
+seed: 42
+data:
+  splits_path: data/MIBIG/splits/strict_bigscape_butina_cv_seed42_n10.tsv
+featurization:
+  bgc_encoder: frozen_esm2_t30_antismash_domain_sequence
+  molecule_encoder: molformer
+model:
+  name: dual_encoder_clip
+  bgc_aggregation: mean
+  bgc_aggregation_config:
+    attention_hidden_dim: 256
+    d_model: 256
+    n_layers: 2
+    n_heads: 4
+    dropout: 0.1
+    max_domains: 512
+    use_protein_positions: false
+    use_domain_positions: false
+    max_proteins: 512
+    max_domains_per_protein: 128
+  emb_dim: 256
+  hidden_dim: 512
+  projection_head: mlp_gelu
+  dropout: 0.1
+  init_temperature: 0.07
+  max_logit_scale: 100.0
+train:
+  epochs: 20
+  batch_size: 128
+  lr: 0.0003
+  weight_decay: 0.0001
+  num_workers: 0
+  scheduler: none
+  warmup_fraction: 0.0
+eval:
+  sim_batch_size: 1024
+  selection_split: val
+  selection_metric: bgc_to_np_recall_at_10
+downstream:
+  feature_batch_size: 256
+  epochs: 30
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  hidden_dim: 256
+  dropout: 0.1
+output:
+  dir: results/final_results

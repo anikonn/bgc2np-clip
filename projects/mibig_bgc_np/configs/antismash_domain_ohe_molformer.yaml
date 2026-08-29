@@ -1,0 +1,45 @@
+seed: 42
+
+data:
+  splits_path: data/MIBIG/splits/strict_bigscape_butina_cv_seed42_n10.tsv
+
+featurization:
+  bgc_encoder: ohe
+  molecule_encoder: molformer
+  one_hot_alphabet: ACDEFGHIKLMNPQRSTVWYX
+  protein_max_length: 1024
+  bgc_batch_size: 1
+  compound_batch_size: 64
+  molformer_model_name: ibm-research/MoLFormer-XL-both-10pct
+  molformer_max_length: 202
+
+model:
+  name: dual_encoder_clip
+  emb_dim: 256
+  hidden_dim: 512
+  dropout: 0.1
+  init_temperature: 0.07
+  max_logit_scale: 100.0
+
+train:
+  epochs: 20
+  batch_size: 256
+  lr: 0.0003
+  weight_decay: 0.0001
+  num_workers: 0
+
+eval:
+  sim_batch_size: 1024
+  selection_split: val
+
+downstream:
+  feature_batch_size: 1024
+  epochs: 30
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 0.0001
+  hidden_dim: 256
+  dropout: 0.1
+
+output:
+  dir: results/antismash_domain_ohe_molformer

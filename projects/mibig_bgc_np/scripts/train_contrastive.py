@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache_dir", type=str, required=True)
     parser.add_argument("--splits_path", type=str, default=None)
     parser.add_argument("--cv_fold", type=int, default=None)
+    parser.add_argument("--val_fold", type=int, default=None)
     parser.add_argument("--config", type=str, default="projects/mibig_bgc_np/configs/default.yaml")
     parser.add_argument("--override", nargs="*", default=[])
     return parser.parse_args()
@@ -43,6 +44,7 @@ def main() -> None:
         device=device,
         splits_path=splits_path,
         cv_fold=args.cv_fold,
+        val_fold=args.val_fold,
     )
     logger.info("Train loss: %.6f", metrics["train"]["loss_last_epoch"])
 

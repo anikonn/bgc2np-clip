@@ -35,6 +35,7 @@ from projects.mibig_bgc_np.training.contrastive_trainer import (
     _build_positive_pair_set,
     _get_cached_paths,
     _infer_input_dims,
+    _pad_bgc_features,
     build_unique_embeddings,
     evaluate_split_retrieval,
 )
@@ -240,9 +241,11 @@ def _build_raw_bgc_features(
             "Rebuild the cache with --bgcmac_splits_path and --fasta_path."
         )
     if bgc_df.empty:
-        dim = int(next(iter(bgc_cache.values())).numel())
+        example = next(iter(bgc_cache.values()))
+        dim = int(example.numel() if example.ndim == 1 else example.shape[-1])
         return torch.empty((0, dim), dtype=torch.float32), torch.empty((0, len(label_to_idx)), dtype=torch.float32)
-    x = torch.stack([bgc_cache[str(bgc_id)].float() for bgc_id in bgc_df["bgc_id"].tolist()])
+    features = [bgc_cache[str(bgc_id)].float() for bgc_id in bgc_df["bgc_id"].tolist()]
+    x = torch.stack([feature if feature.ndim == 1 else feature.mean(dim=0) for feature in features])
     y, _ = _build_label_matrix(bgc_df, label_to_idx)
     return x, y
 
@@ -263,8 +266,9 @@ def _predict_raw_classifier(
     with torch.no_grad():
         for start in range(0, len(bgc_df), batch_size):
             chunk = bgc_df.iloc[start : start + batch_size]
-            features = torch.stack([bgc_cache[str(bgc_id)].float() for bgc_id in chunk["bgc_id"].tolist()]).to(device)
-            probs.append(torch.sigmoid(classifier(features)).cpu())
+            features = [bgc_cache[str(bgc_id)].float() for bgc_id in chunk["bgc_id"].tolist()]
+            batch_features = torch.stack([feature if feature.ndim == 1 else feature.mean(dim=0) for feature in features]).to(device)
+            probs.append(torch.sigmoid(classifier(batch_features)).cpu())
     return torch.cat(probs, dim=0) if probs else torch.empty((0, 0), dtype=torch.float32)
 
 
@@ -287,8 +291,8 @@ def _predict_bgc_probabilities(
     with torch.no_grad():
         for start in range(0, len(bgc_ids), batch_size):
             batch_ids = bgc_ids[start : start + batch_size]
-            features = torch.stack([bgc_cache[bgc_id].float() for bgc_id in batch_ids]).to(device)
-            embeddings = model.encode_bgc(features)
+            features, padding_mask = _pad_bgc_features([bgc_cache[bgc_id].float() for bgc_id in batch_ids], device)
+            embeddings = model.encode_bgc(features, padding_mask=padding_mask)
             logits = classifier(embeddings)
             probs.append(torch.sigmoid(logits).cpu())
     return torch.cat(probs, dim=0) if probs else torch.empty((0, 0), dtype=torch.float32)
@@ -338,12 +342,16 @@ def _ensemble_multilabel_report(
         tp = float(((y_true_col == 1) & (y_pred_col == 1)).sum().item())
         fp = float(((y_true_col == 0) & (y_pred_col == 1)).sum().item())
         fn = float(((y_true_col == 1) & (y_pred_col == 0)).sum().item())
+        tn = float(((y_true_col == 0) & (y_pred_col == 0)).sum().item())
         support = int((y_true_col == 1).sum().item())
+        total = tp + tn + fp + fn
+        accuracy = (tp + tn) / total if total else 0.0
         precision = tp / (tp + fp) if (tp + fp) else 0.0
         recall = tp / (tp + fn) if (tp + fn) else 0.0
         f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) else 0.0
         fpr, tpr, auc = _binary_roc_curve(y_true_col, y_score_col)
         metrics = {
+            "accuracy": float(accuracy),
             "precision": float(precision),
             "recall": float(recall),
             "f1": float(f1),
@@ -420,8 +428,6 @@ def _display_bgcmac_class(class_name: str) -> str:
 
 def _metric_value(report: dict[str, Any], class_name: str, metric_name: str) -> float:
     class_metrics = report["bgc_class"]["test"]["per_class"].get(class_name, {})
-    if metric_name == "AUROC":
-        return float(class_metrics.get("auroc", 0.0))
     if metric_name == "F1":
         return float(class_metrics.get("f1", 0.0))
     return float(class_metrics.get(metric_name.lower(), 0.0))
@@ -448,11 +454,11 @@ def _save_bgcmac_metrics_table(
     rows: list[dict[str, Any]] = []
     for class_name in classes:
         support = _support_value(full_report, class_name) or _support_value(strict_report, class_name)
-        for metric_name in ("AUROC", "recall", "precision", "F1"):
+        for metric_name in ("Accuracy", "Precision", "Recall", "F1"):
             rows.append(
                 {
-                    "class": _display_bgcmac_class(class_name) if metric_name == "AUROC" else "",
-                    "BGC count": support if metric_name == "AUROC" else "",
+                    "class": _display_bgcmac_class(class_name) if metric_name == "Accuracy" else "",
+                    "BGC count": support if metric_name == "Accuracy" else "",
                     "model": metric_name,
                     "BGC-MAC": _metric_value(strict_report, class_name, metric_name),
                     "BGC-MAC-full": _metric_value(full_report, class_name, metric_name),
@@ -983,6 +989,9 @@ def _make_model(cfg: dict[str, Any], bgc_dim: int, compound_dim: int, device: to
         dropout=cfg["model"]["dropout"],
         init_temperature=cfg["model"]["init_temperature"],
         max_logit_scale=cfg["model"]["max_logit_scale"],
+        bgc_aggregation=str(cfg["model"].get("bgc_aggregation", "prepooled")),
+        bgc_aggregation_config=cfg["model"].get("bgc_aggregation_config", {}),
+        projection_head=str(cfg["model"].get("projection_head", "mlp_gelu")),
     ).to(device)
 
 
@@ -1014,6 +1023,9 @@ def _run_epoch(
     with context:
         for batch in loader:
             bgc_features = batch["bgc_feature"].to(device)
+            bgc_padding_mask = batch.get("bgc_padding_mask")
+            if bgc_padding_mask is not None:
+                bgc_padding_mask = bgc_padding_mask.to(device)
             compound_features = batch["compound_feature"].to(device)
             positive_mask = _build_batch_positive_mask(
                 bgc_ids=batch["bgc_id"],
@@ -1023,7 +1035,12 @@ def _run_epoch(
             )
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
-            loss, _ = model(bgc_features, compound_features, positive_mask=positive_mask)
+            loss, _ = model(
+                bgc_features,
+                compound_features,
+                positive_mask=positive_mask,
+                bgc_padding_mask=bgc_padding_mask,
+            )
             if optimizer is not None:
                 loss.backward()
                 optimizer.step()
@@ -1167,14 +1184,16 @@ def _metrics_from_similarity(sim: torch.Tensor, pairs: list[tuple[int, int]]) ->
         has_pos = sorted_pos.any(dim=1)
         first_idx = sorted_pos.float().argmax(dim=1)
         ranks = torch.where(has_pos, first_idx + 1, torch.full_like(first_idx, fill_value=sorted_pos.size(1) + 1))
+        positives = float(sorted_pos.float().sum().item())
+        metrics = {"mrr": float((1.0 / ranks.float()).mean().item())}
+        for k in (1, 5, 10):
+            cutoff = min(int(k), int(sorted_pos.size(1)))
+            hits = float(sorted_pos[:, :cutoff].float().sum().item())
+            metrics[f"hit_at_{k}"] = float(sorted_pos[:, :cutoff].any(dim=1).float().mean().item())
+            metrics[f"recall_at_{k}"] = hits / positives if positives > 0.0 else 0.0
+            metrics[f"precision_at_{k}"] = float((sorted_pos[:, :cutoff].float().sum(dim=1) / float(k)).mean().item())
         return {
-            "recall_at_1": float(sorted_pos[:, :1].any(dim=1).float().mean().item()),
-            "recall_at_5": float(sorted_pos[:, :5].any(dim=1).float().mean().item()),
-            "recall_at_10": float(sorted_pos[:, :10].any(dim=1).float().mean().item()),
-            "precision_at_1": float((sorted_pos[:, :1].float().sum(dim=1) / 1.0).mean().item()),
-            "precision_at_5": float((sorted_pos[:, :5].float().sum(dim=1) / 5.0).mean().item()),
-            "precision_at_10": float((sorted_pos[:, :10].float().sum(dim=1) / 10.0).mean().item()),
-            "mrr": float((1.0 / ranks.float()).mean().item()),
+            **metrics,
         }
 
     sorted_right = torch.argsort(sim, dim=1, descending=True)

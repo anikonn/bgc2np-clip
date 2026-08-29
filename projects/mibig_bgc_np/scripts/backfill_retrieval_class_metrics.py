@@ -65,6 +65,7 @@ def _load_model(checkpoint_path: Path, device: torch.device) -> DualEncoderCLIP:
         dropout=float(cfg["model"]["dropout"]),
         init_temperature=float(cfg["model"]["init_temperature"]),
         max_logit_scale=float(cfg["model"]["max_logit_scale"]),
+        projection_head=str(cfg["model"].get("projection_head", "mlp_gelu")),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()

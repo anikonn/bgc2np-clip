@@ -29,6 +29,7 @@ from projects.mibig_bgc_np.scripts.run_bgcmac_ensemble import (
     _split_counts,
     _train_one_member,
 )
+from projects.mibig_bgc_np.training.contrastive_trainer import _pad_bgc_features
 from projects.mibig_bgc_np.utils.seed import set_seed
 
 
@@ -147,10 +148,11 @@ def _encode_ids(
     with torch.no_grad():
         for start in range(0, len(ids), batch_size):
             batch_ids = ids[start : start + batch_size]
-            features = torch.stack([cache[item_id].float() for item_id in batch_ids]).to(device)
             if modality == "bgc":
-                embeddings = model.encode_bgc(features).cpu()
+                features, padding_mask = _pad_bgc_features([cache[item_id].float() for item_id in batch_ids], device)
+                embeddings = model.encode_bgc(features, padding_mask=padding_mask).cpu()
             elif modality == "compound":
+                features = torch.stack([cache[item_id].float() for item_id in batch_ids]).to(device)
                 embeddings = model.encode_compound(features).cpu()
             else:
                 raise ValueError(f"Unsupported modality: {modality}")
