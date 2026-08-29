@@ -3,6 +3,35 @@ data/
 cache/
 results/
 condor/
+logs/
+wandb/
+mlruns/
+outputs/
+checkpoints/
+
+# Model/checkpoint/cache blobs
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+*.parquet
+
+# Cluster/runtime logs
+*.log
+*.out
+*.err
+*.nodes.log
+*.dagman.out
+*.dagman.log
+*.lib.out
+*.lib.err
+*.rescue*
+*.lock
+*.condor.sub
 
 # Vendored or external code
 teachopencadd/
@@ -15,19 +44,25 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
 .coverage
 .coverage.*
 htmlcov/
 .venv/
 venv/
+env/
+*.egg-info/
 
 # Packaging artifacts
 build/
 dist/
-*.egg-info/
 
 # Notebook and editor noise
 .ipynb_checkpoints/
 .DS_Store
 *.swp
 *.swo
+*~
+
+# Accidental shell/Condor fragments
+/-af

@@ -3,6 +3,52 @@
 CLIP-style retrieval pipeline for matching MIBiG biosynthetic gene clusters
 (BGCs) with natural products.
 
+## At a Glance
+
+BGC2NP-CLIP learns a shared embedding space for biosynthetic gene clusters and
+natural products. Given a query BGC, the model ranks candidate molecules by CLIP
+similarity; given a query molecule, it can rank candidate BGCs in the same
+space.
+
+The current paper model uses:
+
+- **BGC encoder:** antiSMASH-annotated BGC domains embedded with frozen
+  ESM-2 t33 (`facebook/esm2_t33_650M_UR50D`) and masked-mean aggregated.
+- **Natural product encoder:** frozen MolFormer
+  (`ibm-research/MoLFormer-XL-both-10pct`) using the pooled molecule
+  representation.
+- **Training objective:** symmetric multi-positive contrastive loss over known
+  BGC–NP associations.
+- **Projection head:** two-layer MLP projection into a shared 256-dimensional
+  CLIP space.
+
+This repository contains the reusable code, configs, tests, and experiment
+documentation. Large raw datasets, cached embeddings, Condor logs, trained
+checkpoints, and generated figures are intentionally excluded from git.
+
+## Repository Map
+
+```text
+projects/mibig_bgc_np/          Main project code: data loading, encoders, models, training, evaluation
+src/clip_core/                  Shared CLIP utilities: config, loss, retrieval helpers, logging
+src/mibig_clip/                 MIBiG-specific visualization helpers
+scripts/                        Reproducibility and figure/table generation scripts
+experiments/                    Curated notes for larger ablation/screening experiments
+tests/                          Smoke and unit tests
+EXPERIMENTS.md                  Experiment provenance and paper-result notes
+PUBLICATION_CLEANUP.md          What to keep local vs publish
+```
+
+For local paper outputs, the final-result convention is:
+
+```text
+results/final_results_t33/              Model outputs, metrics, and machine-readable summaries
+results/paper_plots/final_results_t33/  Poster/paper-ready figures and tables
+```
+
+These paths are ignored by git because they contain generated artifacts and
+large files.
+
 ## What This Repo Contains
 
 ```text
@@ -64,12 +110,13 @@ the training scripts.
 The standard workflow is:
 
 1. Preprocess raw MIBiG files.
-2. Create split files.
-3. Cache BGC and compound features.
-4. Train the contrastive model.
-5. Evaluate retrieval.
-6. Visualize embeddings.
-7. Train downstream prediction tasks.
+2. Create EDA and downstream target distribution plots.
+3. Create split files.
+4. Cache BGC and compound features.
+5. Train the contrastive model.
+6. Evaluate retrieval.
+7. Visualize embeddings.
+8. Train downstream prediction tasks.
 
 Most pipeline steps should be run as Python modules:
 
@@ -79,6 +126,21 @@ python -m projects.mibig_bgc_np.scripts.<script_name>
 
 Top-level helper scripts are available for preprocessing, split generation, and
 the downstream wrapper.
+
+## Results Folder Convention
+
+Use these two stable folders for non-model diagnostic plots:
+
+```text
+results/EDA/                         Dataset statistics and exploratory plots
+results/downstream_distributions/    Target-value distributions for downstream tasks
+```
+
+`results/EDA/` is for plots and tables about the raw or processed dataset, such
+as bioactivity label counts and protein/gene length distributions.
+
+`results/downstream_distributions/` is for distributions of values that become
+downstream prediction targets, such as molecular weight, logP, and TPSA.
 
 ## Expected Data
 
@@ -139,6 +201,110 @@ Notes:
 - BGCs with more than 3000 proteins are dropped during preprocessing.
 - `bgc_classes` preserves all annotated biosynthetic classes as a semicolon-separated multilabel field.
 - `bgc_class` mirrors the same semicolon-separated value for compatibility.
+
+## Step 1b: Dataset EDA And Target Distributions
+
+Create EDA artifacts under `results/EDA/`:
+
+```bash
+python -m projects.mibig_bgc_np.scripts.create_eda_artifacts \
+  --json_dir data/MIBIG/mibig_json_4.0 \
+  --proteins_path data/MIBIG/processed/bgc_proteins.jsonl \
+  --outdir results/EDA
+```
+
+Important outputs:
+
+```text
+results/EDA/observed_bioactivity_upset.png
+results/EDA/observed_bioactivity_class_counts.png
+results/EDA/observed_bioactivity_class_counts.csv
+results/EDA/observed_bioactivity_intersections.csv
+results/EDA/protein_length_distribution.png
+results/EDA/genes_per_bgc_distribution.png
+results/EDA/eda_manifest.json
+```
+
+Bioactivity classes are assigned only when a compound bioactivity entry has
+`observed: true`. The UpSet-style plot counts BGCs with observed bioactivity
+classes.
+
+Create per-fold counts for priority observed bioactivity classes across all CV
+split types:
+
+```bash
+python -m projects.mibig_bgc_np.scripts.create_split_bioactivity_fold_tables \
+  --outdir results/EDA/split_bioactivity_fold_counts
+```
+
+This writes one table per split type under
+`results/EDA/split_bioactivity_fold_counts/`, for example:
+
+```text
+bgc_fold_bioactivity_counts.csv
+np_fold_bioactivity_counts.csv
+combined_fold_bioactivity_counts.csv
+strict_fold_bioactivity_counts.csv
+```
+
+The default classes are `antibacterial`, `cytotoxic`, `antifungal`,
+`inhibitor`, `siderophore`, and `antiviral`. These tables count distinct BGCs
+per fold. For NP and strict pair-level split files, a BGC is counted once in a
+fold if any of its pair rows is assigned to that fold.
+
+Create per-fold NPClassifier class, superclass, and pathway counts across all
+CV split types:
+
+```bash
+python -m projects.mibig_bgc_np.scripts.create_split_npclassifier_fold_tables \
+  --outdir results/EDA/split_npclassifier_fold_counts
+```
+
+This writes one table per split type and NPClassifier level under
+`results/EDA/split_npclassifier_fold_counts/`, for example:
+
+```text
+bgc_fold_npclassifier_class_counts.csv
+np_fold_npclassifier_superclass_counts.csv
+combined_fold_npclassifier_pathway_counts.csv
+strict_fold_npclassifier_class_counts.csv
+```
+
+These tables count distinct canonical compounds per fold. For BGC and combined
+BGC-level split files, every compound row for a BGC inherits that BGC fold. For
+NP and strict pair-level split files, counts follow the BGC-compound row fold
+assignment.
+
+Create downstream target-value distributions under
+`results/downstream_distributions/`:
+
+```bash
+python -m projects.mibig_bgc_np.scripts.create_downstream_distributions \
+  --pairs_path data/MIBIG/processed/mibig_pairs.tsv \
+  --outdir results/downstream_distributions
+```
+
+Important outputs:
+
+```text
+results/downstream_distributions/molecular_property_values.csv
+results/downstream_distributions/molecular_weight_distribution.png
+results/downstream_distributions/logp_distribution.png
+results/downstream_distributions/tpsa_distribution.png
+results/downstream_distributions/molecular_property_distributions.png
+results/downstream_distributions/npclassifier_class_counts.csv
+results/downstream_distributions/npclassifier_class_distribution.png
+results/downstream_distributions/npclassifier_superclass_counts.csv
+results/downstream_distributions/npclassifier_superclass_distribution.png
+results/downstream_distributions/npclassifier_pathway_counts.csv
+results/downstream_distributions/npclassifier_pathway_distribution.png
+results/downstream_distributions/downstream_distribution_manifest.json
+```
+
+Molecular weight, logP, and TPSA are computed with RDKit from unique valid
+compound SMILES in `mibig_pairs.tsv`.
+If `data/MIBIG/processed/mibig_npclassifier_labels.tsv` exists, the same script
+also plots NPClassifier class, superclass, and pathway label distributions.
 
 ## Step 2: Create Splits
 
@@ -769,7 +935,13 @@ python scripts/train_downstream.py \
 By default, all downstream tasks run:
 
 - `bgc_class`
+- `bioactivity_class`
+- `npclassifier_pathway`
+- `npclassifier_superclass`
+- `npclassifier_class`
 - `compound_mw`
+- `compound_logp`
+- `compound_tpsa`
 - `origin_type`
 
 Use repeated `--task` flags to run a subset:
@@ -790,6 +962,8 @@ Useful optional flags:
 - `--cv_fold 1`
 - `--mibig_pairs_path data/MIBIG/processed/mibig_pairs.tsv`
 - `--npatlas_path data/NPAtlas_download_2024_09.tsv`
+- `--bioactivity_table_path results/EDA/bgc_observed_bioactivities.csv`
+- `--npclassifier_pair_labels_path data/MIBIG/processed/mibig_pairs_npclassifier_labels.tsv`
 - `--save_cm_png`
 
 Common downstream outputs:
@@ -803,8 +977,43 @@ matched_compounds.tsv
 Task-specific outputs:
 
 - `bgc_class`: multilabel metrics, per-class metrics, ROC curve coordinates, and optional confusion-matrix and ROC PNGs
+- `bioactivity_class`: multilabel prediction for observed `antibacterial`, `cytotoxic`, `antifungal`, `inhibitor`, `siderophore`, and `antiviral` classes; writes per-class AUROCs, ROC curves, one-vs-rest confusion matrices, and dataset stats
+- `npclassifier_pathway`: multilabel prediction of NPClassifier pathways from BGC embeddings; uses all pathway labels in `mibig_pairs_npclassifier_labels.tsv`
+- `npclassifier_superclass`: multilabel prediction of NPClassifier superclasses from BGC embeddings; uses labels with more than 100 compounds in `results/downstream_distributions/npclassifier_superclass_counts.csv`
+- `npclassifier_class`: multilabel prediction of NPClassifier classes from BGC embeddings; uses labels with more than 50 compounds in `results/downstream_distributions/npclassifier_class_counts.csv`
 - `origin_type`: `downstream_origin_type_metrics.json`, `downstream_origin_type_dataset_stats.json`, and optional confusion-matrix PNGs
-- `compound_mw`: `downstream_compound_mw_metrics.json`, `downstream_mw_hist.png`, `downstream_mw_by_bgc_class.png`, and `downstream_mw_by_origin_type.png`
+- `compound_mw`: molecular weight regression metrics and `downstream_mw_*` distribution plots
+- `compound_logp`: RDKit Wildman-Crippen logP regression metrics and `downstream_logp_*` distribution plots
+- `compound_tpsa`: RDKit TPSA regression metrics and `downstream_tpsa_*` distribution plots
+
+Compound property regression reports include Pearson and Spearman correlations,
+MSE, RMSE, and R2.
+
+After CV finishes, create flat downstream metric tables from the four split
+summaries:
+
+```bash
+python -m projects.mibig_bgc_np.scripts.create_downstream_metric_tables \
+  --outdir results/downstream_metric_tables
+```
+
+Important outputs:
+
+```text
+results/downstream_metric_tables/downstream_metrics_long.csv
+results/downstream_metric_tables/downstream_metrics_wide.csv
+results/downstream_metric_tables/downstream_metrics_short_wide.csv
+results/downstream_metric_tables/bgc_downstream_metrics_wide.csv
+results/downstream_metric_tables/np_downstream_metrics_wide.csv
+results/downstream_metric_tables/combined_downstream_metrics_wide.csv
+results/downstream_metric_tables/strict_downstream_metrics_wide.csv
+```
+
+The long table has one row per split, downstream task, and metric. The wide
+tables have one row per downstream task with repeated `metric_*`, `value_*`,
+`std_*`, and `n_folds_*` columns.
+The short wide tables omit paths and internal task keys, with repeated
+`metric_*`, `mean_*`, and `std_*` columns.
 
 ## Cross-Validation
 
@@ -902,6 +1111,18 @@ python -m projects.mibig_bgc_np.scripts.plot_retrieval_summary \
 This writes Top-K Recall plots, an MRR bar plot for the baselines and model,
 and aggregate retrieval BGC-class ROC/confusion plots when
 `retrieval_class_test.classes` is present in the summary.
+
+After all BGC, NP, combined, and strict CV runs finish, create the molecular
+property prediction summary plot:
+
+```bash
+python -m projects.mibig_bgc_np.scripts.plot_molecular_property_prediction \
+  --outdir results/molecular_property_prediction
+```
+
+This writes a CSV plus `molecular_property_prediction.png`, a two-panel plot
+titled "Molecular property prediction" with Pearson and Spearman correlations
+for molecular weight, logP, and TPSA across BGC, NP, combined, and strict splits.
 
 You can also bypass the naming convention with an explicit split file:
 
